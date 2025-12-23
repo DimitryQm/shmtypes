@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke-build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-gcc
+            os: ubuntu-latest
+            cxx: g++
+            cxxflags: -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror
+          - name: linux-clang
+            os: ubuntu-latest
+            cxx: clang++
+            cxxflags: -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror
+          - name: macos-clang
+            os: macos-latest
+            cxx: clang++
+            cxxflags: -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror
+          - name: windows-msvc
+            os: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: MSVC dev environment
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Header-only compile sanity (POSIX)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build_header_sanity.cpp <<'CPP'
+          #include "shmTypes.hpp"
+          int main() { return 0; }
+          CPP
+          "${{ matrix.cxx }}" ${{ matrix.cxxflags }} -I. -c build_header_sanity.cpp -o build_header_sanity.o
+
+      - name: Build examples (POSIX)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/examples
+          shopt -s nullglob
+          files=(examples/*.cpp)
+          if (( ${#files[@]} == 0 )); then
+            echo "No examples/*.cpp found; skipping."
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            out="build/examples/$(basename "${f%.*}")"
+            echo "Compiling ${f} -> ${out}"
+            "${{ matrix.cxx }}" ${{ matrix.cxxflags }} -I. -o "${out}" "${f}"
+          done
+
+      - name: Header-only compile sanity (MSVC)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          #include "shmTypes.hpp"
+          int main() { return 0; }
+          '@ | Out-File -Encoding ascii build_header_sanity.cpp
+          cl /nologo /std:c++20 /O2 /W4 /WX /permissive- /EHsc /I. /c build_header_sanity.cpp /Fo:build_header_sanity.obj
+
+      - name: Build examples (MSVC)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path build/examples | Out-Null
+          $files = Get-ChildItem -Path examples -Filter *.cpp -ErrorAction SilentlyContinue
+          if (-not $files) {
+            Write-Host "No examples/*.cpp found; skipping."
+            exit 0
+          }
+          foreach ($f in $files) {
+            $out = "build/examples/$($f.BaseName).exe"
+            Write-Host "Compiling $($f.FullName) -> $out"
+            cl /nologo /std:c++20 /O2 /W4 /WX /permissive- /EHsc /I. /Fe:$out $f.FullName
+          }
