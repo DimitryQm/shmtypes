@@ -71,18 +71,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build/tests
-          mapfile -t files < <(find tests -type f -name '*.cpp' 2>/dev/null | sort || true)
-          if (( ${#files[@]} == 0 )); then
-            echo "No tests/*.cpp found; skipping."
-            exit 0
-          fi
-          for f in "${files[@]}"; do
+
+          found=0
+          while IFS= read -r -d '' f; do
+            found=1
             out="build/tests/$(basename "${f%.*}")"
             echo "Compiling ${f} -> ${out}"
             "${{ matrix.cxx }}" ${{ matrix.cxxflags }} -I. -Iinclude -o "${out}" "${f}"
             echo "Running ${out}"
             "${out}"
-          done
+          done < <(find tests -type f -name '*.cpp' -print0 2>/dev/null)
+
+          if [[ $found -eq 0 ]]; then
+            echo "No tests/*.cpp found; skipping."
+            exit 0
+          fi
 
       - name: Build benchmarks (compile only, POSIX)
         if: matrix.os != 'windows-latest'
@@ -90,16 +93,20 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build/benchmark
-          mapfile -t files < <(find benchmark -type f -name '*.cpp' 2>/dev/null | sort || true)
-          if (( ${#files[@]} == 0 )); then
-            echo "No benchmark/*.cpp found; skipping."
-            exit 0
-          fi
-          for f in "${files[@]}"; do
+
+          found=0
+          while IFS= read -r -d '' f; do
+            found=1
             out="build/benchmark/$(basename "${f%.*}")"
             echo "Compiling ${f} -> ${out}"
             "${{ matrix.cxx }}" ${{ matrix.cxxflags }} -I. -Iinclude -o "${out}" "${f}"
-          done
+          done < <(find benchmark -type f -name '*.cpp' -print0 2>/dev/null)
+
+          if [[ $found -eq 0 ]]; then
+            echo "No benchmark/*.cpp found; skipping."
+            exit 0
+          fi
+
 
       - name: Header-only compile sanity (MSVC)
         if: matrix.os == 'windows-latest'
