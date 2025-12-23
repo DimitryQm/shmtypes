@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <type_traits>
 #include <limits>
+#include <bit>
 
 #if defined(_MSC_VER)
   #define SHM_FORCE_INLINE __forceinline
@@ -51,8 +52,10 @@ namespace detail {
         !std::is_same_v<I, bool> &&
         (sizeof(I) <= sizeof(iptr));
 
+    
     SHM_FORCE_INLINE constexpr uptr addr(const void* p) noexcept {
-        return reinterpret_cast<uptr>(p);
+      static_assert(sizeof(uptr) == sizeof(p));
+      return std::bit_cast<uptr>(p);
     }
 
     template <class To>
