@@ -95,6 +95,14 @@ struct self_anchor {
     }
 };
 
+struct self_reloc_anchor {
+    static constexpr bool kSelfRelative = true;
+    static SHM_FORCE_INLINE detail::uptr base(const void* self) noexcept {
+        return detail::addr(self);
+    }
+};
+
+
 template <class Tag>
 struct segment_anchor {
     static constexpr bool kSelfRelative = false;
@@ -110,7 +118,7 @@ class offset_ptr {
 public:
     using element_type = T;
     using pointer      = T*;
-    using reference    = std::add_lvalue_reference_t<T>;
+    using reference = std::add_lvalue_reference_t<T>;
     using offset_type  = OffsetT;
 
     static_assert(detail::is_obj_or_void_v<T>,
@@ -189,7 +197,7 @@ class offset_ptr<T, segment_anchor<Tag>, OffsetT> {
 public:
     using element_type = T;
     using pointer      = T*;
-    using reference    = std::add_lvalue_reference_t<T>; // void -> void (no ref)
+    using reference = std::add_lvalue_reference_t<T>;
     using offset_type  = OffsetT;
 
     static_assert(detail::is_obj_or_void_v<T>,
@@ -259,8 +267,86 @@ private:
     offset_type off_plus1_ = 0;
 };
 
+template <class T, detail::offset_int OffsetT>
+class offset_ptr<T, self_reloc_anchor, OffsetT> {
+public:
+    using element_type = T;
+    using pointer      = T*;
+    using reference = std::add_lvalue_reference_t<T>;
+    using offset_type  = OffsetT;
+
+    static_assert(detail::is_obj_or_void_v<T>,
+                  "offset_ptr<T>: T must be an object type or void.");
+
+    constexpr offset_ptr() noexcept = default;
+    constexpr offset_ptr(std::nullptr_t) noexcept : off_plus1_(0) {}
+    SHM_FORCE_INLINE explicit offset_ptr(pointer p) noexcept { set(p); }
+
+    offset_ptr(const offset_ptr&) noexcept = default;
+    offset_ptr(offset_ptr&&) noexcept = default;
+    offset_ptr& operator=(const offset_ptr&) noexcept = default;
+    offset_ptr& operator=(offset_ptr&&) noexcept = default;
+    ~offset_ptr() = default;
+
+    template <class U>
+    requires (std::is_convertible_v<U*, T*>)
+    SHM_FORCE_INLINE offset_ptr(const offset_ptr<U, self_reloc_anchor, OffsetT>& other) noexcept
+        : off_plus1_(other.raw_storage()) {}
+
+    SHM_FORCE_INLINE offset_ptr& operator=(pointer p) noexcept { set(p); return *this; }
+    SHM_FORCE_INLINE offset_ptr& operator=(std::nullptr_t) noexcept { off_plus1_ = 0; return *this; }
+
+    [[nodiscard]] SHM_FORCE_INLINE pointer get() const noexcept {
+        const offset_type s = off_plus1_;
+        if (SHM_UNLIKELY(s == 0)) return nullptr;
+
+        const detail::uptr b = self_reloc_anchor::base(this);
+
+        if constexpr (std::is_signed_v<offset_type>) {
+            const detail::iptr off = static_cast<detail::iptr>(s) - 1;
+            return reinterpret_cast<pointer>(b + static_cast<detail::uptr>(off));
+        } else {
+            const detail::uptr off = static_cast<detail::uptr>(s - 1);
+            return reinterpret_cast<pointer>(b + off);
+        }
+    }
+
+    [[nodiscard]] SHM_FORCE_INLINE offset_type raw_storage() const noexcept { return off_plus1_; }
+    [[nodiscard]] SHM_FORCE_INLINE explicit operator bool() const noexcept { return off_plus1_ != 0; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE U& operator*() const noexcept { return *get(); }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE U* operator->() const noexcept { return get(); }
+
+private:
+    SHM_FORCE_INLINE void set(pointer p) noexcept {
+        if (!p) { off_plus1_ = 0; return; }
+
+        const detail::uptr b = self_reloc_anchor::base(this);
+        const detail::uptr t = detail::addr(p);
+        const detail::iptr diff = static_cast<detail::iptr>(t) - static_cast<detail::iptr>(b);
+
+        if constexpr (std::is_signed_v<offset_type>) {
+            SHM_ASSERT(diff != -1 && "diff == -1 would encode to 0 (reserved for null).");
+            off_plus1_ = detail::narrow_checked<offset_type>(diff + 1);
+        } else {
+            SHM_ASSERT(diff >= 0);
+            off_plus1_ = detail::narrow_checked<offset_type>(diff + 1);
+        }
+    }
+
+    offset_type off_plus1_ = 0;
+};
+
 template <class T, class Tag, detail::offset_int OffsetT = std::uint32_t>
 using segment_offset_ptr = offset_ptr<T, segment_anchor<Tag>, OffsetT>;
+template <class T, detail::offset_int OffsetT = std::int32_t>
+using self_reloc_ptr = offset_ptr<T, self_reloc_anchor, OffsetT>;
+
 
 
 template <class T1, class A1, detail::offset_int O1,
