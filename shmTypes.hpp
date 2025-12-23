@@ -4,6 +4,10 @@
 #include <cstdint>
 #include <limits>
 #include <type_traits>
+#include <atomic>
+#include <new>
+#include <utility>
+#include <cstring>
 
 #if defined(_MSC_VER)
   #define SHM_FORCE_INLINE __forceinline
@@ -388,5 +392,182 @@ requires (detail::is_obj_or_void_v<T>)
 SHM_FORCE_INLINE bool operator!=(std::nullptr_t, const offset_ptr<T, A, O>& a) noexcept {
     return !(a == nullptr);
 }
+
+
+template <class Tag, detail::offset_int OffsetT = std::uint32_t>
+class linear_allocator {
+public:
+    using tag_type    = Tag;
+    using offset_type = OffsetT;
+
+    template <class T>
+    using handle = shm::segment_offset_ptr<T, Tag, OffsetT>;
+
+    using void_handle = handle<void>;
+
+    linear_allocator(void* start, std::size_t size) noexcept
+        : linear_allocator(start, start, size)
+    {}
+
+    linear_allocator(void* segment_base, void* arena_start, std::size_t arena_size) noexcept
+        : arena_(reinterpret_cast<std::byte*>(arena_start))
+        , arena_addr_(reinterpret_cast<std::uintptr_t>(arena_start))
+        , capacity_(arena_size)
+        , cursor_(0)
+    {
+
+        shm::segment_base<Tag>::set(segment_base);
+    }
+
+    linear_allocator(const linear_allocator&) = delete;
+    linear_allocator& operator=(const linear_allocator&) = delete;
+    linear_allocator(linear_allocator&&) = delete;
+    linear_allocator& operator=(linear_allocator&&) = delete;
+
+    [[nodiscard]] void* alloc(std::size_t n,
+                              std::size_t alignment = alignof(std::max_align_t)) noexcept
+    {
+        if (n == 0) return nullptr;
+        if (alignment == 0) alignment = 1;
+
+        const bool pow2 = (alignment & (alignment - 1)) == 0;
+
+        std::size_t cur = cursor_.load(std::memory_order_relaxed);
+        for (;;) {
+            if (cur > capacity_) return nullptr;
+
+            const std::uintptr_t addr = arena_addr_ + static_cast<std::uintptr_t>(cur);
+            std::uintptr_t aligned_addr;
+
+            if (pow2) {
+                const std::uintptr_t mask = static_cast<std::uintptr_t>(alignment - 1);
+                aligned_addr = (addr + mask) & ~mask;
+            } else {
+                const std::uintptr_t a = static_cast<std::uintptr_t>(alignment);
+                const std::uintptr_t rem = addr % a;
+                aligned_addr = (rem == 0) ? addr : (addr + (a - rem));
+            }
+
+            const std::uintptr_t aligned_off_u = aligned_addr - arena_addr_;
+            if (aligned_off_u > static_cast<std::uintptr_t>(capacity_)) return nullptr;
+
+            const std::size_t aligned_off = static_cast<std::size_t>(aligned_off_u);
+            if (n > capacity_ - aligned_off) return nullptr;
+
+            const std::size_t next = aligned_off + n;
+
+            if (cursor_.compare_exchange_weak(
+                    cur, next,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed))
+            {
+                return arena_ + aligned_off;
+            }
+        }
+    }
+
+    [[nodiscard]] void_handle alloc_handle(std::size_t n,
+                                           std::size_t alignment = alignof(std::max_align_t)) noexcept
+    {
+        void* p = alloc(n, alignment);
+        if (!p) return void_handle(nullptr);
+        return void_handle(static_cast<void*>(p));
+    }
+
+    template <class T>
+    [[nodiscard]] T* allocate(std::size_t count = 1) noexcept {
+        static_assert(!std::is_void_v<T>, "allocate<void> is not meaningful.");
+        if (count == 0) return nullptr;
+        if (count > (std::numeric_limits<std::size_t>::max() / sizeof(T))) return nullptr;
+        return static_cast<T*>(alloc(sizeof(T) * count, alignof(T)));
+    }
+
+    template <class T>
+    [[nodiscard]] handle<T> allocate_handle(std::size_t count = 1) noexcept {
+        T* p = allocate<T>(count);
+        if (!p) return handle<T>(nullptr);
+        return handle<T>(p);
+    }
+
+    template <class T, class... Args>
+    [[nodiscard]] handle<T> make_handle(Args&&... args) noexcept(std::is_nothrow_constructible_v<T, Args...>) {
+        void* mem = alloc(sizeof(T), alignof(T));
+        if (!mem) return handle<T>(nullptr);
+        T* obj = ::new (mem) T(std::forward<Args>(args)...);
+        return handle<T>(obj);
+    }
+
+    void reset() noexcept {
+        cursor_.store(0, std::memory_order_release);
+    }
+
+    void secure_reset() noexcept {
+        const std::size_t u = used();
+        if (u) std::memset(arena_, 0, u);
+        cursor_.store(0, std::memory_order_release);
+    }
+
+    [[nodiscard]] std::size_t used() const noexcept {
+        return cursor_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+
+    [[nodiscard]] bool owns(const void* p) const noexcept {
+        const auto x = reinterpret_cast<std::uintptr_t>(p);
+        return x >= arena_addr_ && x < (arena_addr_ + static_cast<std::uintptr_t>(capacity_));
+    }
+
+    
+    template <class T>
+    struct stl_allocator {
+        using value_type = T;
+
+        linear_allocator* arena = nullptr;
+
+        stl_allocator() noexcept = default;
+        explicit stl_allocator(linear_allocator& a) noexcept : arena(&a) {}
+
+        template <class U>
+        stl_allocator(const stl_allocator<U>& other) noexcept : arena(other.arena) {}
+
+        [[nodiscard]] T* allocate(std::size_t n) {
+            if (!arena) throw std::bad_alloc();
+            if (n > (std::numeric_limits<std::size_t>::max() / sizeof(T))) throw std::bad_alloc();
+            void* p = arena->alloc(sizeof(T) * n, alignof(T));
+            if (!p) throw std::bad_alloc();
+            return static_cast<T*>(p);
+        }
+
+        void deallocate(T*, std::size_t) noexcept {
+        }
+
+        template <class U>
+        struct rebind { using other = stl_allocator<U>; };
+
+        using propagate_on_container_copy_assignment = std::true_type;
+        using propagate_on_container_move_assignment = std::true_type;
+        using propagate_on_container_swap            = std::true_type;
+        using is_always_equal                        = std::false_type;
+
+        template <class U>
+        friend bool operator==(const stl_allocator& a, const stl_allocator<U>& b) noexcept {
+            return a.arena == b.arena;
+        }
+        template <class U>
+        friend bool operator!=(const stl_allocator& a, const stl_allocator<U>& b) noexcept {
+            return !(a == b);
+        }
+    };
+
+private:
+    std::byte* const arena_;
+    std::uintptr_t const arena_addr_;
+    std::size_t const capacity_;
+    std::atomic<std::size_t> cursor_;
+};
+
+
+
 
 } // namespace shm
