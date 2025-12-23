@@ -1,9 +1,9 @@
 #pragma once
+#include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <type_traits>
 #include <limits>
-#include <bit>
+#include <type_traits>
 
 #if defined(_MSC_VER)
   #define SHM_FORCE_INLINE __forceinline
@@ -52,10 +52,9 @@ namespace detail {
         !std::is_same_v<I, bool> &&
         (sizeof(I) <= sizeof(iptr));
 
-    
     SHM_FORCE_INLINE constexpr uptr addr(const void* p) noexcept {
-      static_assert(sizeof(uptr) == sizeof(p));
-      return std::bit_cast<uptr>(p);
+        static_assert(sizeof(uptr) == sizeof(p));
+        return std::bit_cast<uptr>(p);
     }
 
     template <class To>
@@ -72,17 +71,21 @@ namespace detail {
 #endif
         return static_cast<To>(v);
     }
+
+    template <class T>
+    inline constexpr bool is_obj_or_void_v =
+        (std::is_object_v<T> || std::is_void_v<T>);
 } // namespace detail
 
 template <class Tag>
 struct segment_base {
     static SHM_FORCE_INLINE void set(void* base) noexcept {
-        base_ = reinterpret_cast<std::byte*>(base);
+        base_ = static_cast<std::byte*>(base);
     }
     static SHM_FORCE_INLINE std::byte* get() noexcept { return base_; }
 
 private:
-    inline static std::byte* base_ = nullptr; 
+    inline static std::byte* base_ = nullptr;
 };
 
 struct self_anchor {
@@ -107,16 +110,17 @@ class offset_ptr {
 public:
     using element_type = T;
     using pointer      = T*;
-    using reference    = T&;
+    using reference    = std::add_lvalue_reference_t<T>;
     using offset_type  = OffsetT;
 
-    static_assert(std::is_object_v<T> || std::is_void_v<T>,
+    static_assert(detail::is_obj_or_void_v<T>,
                   "offset_ptr<T>: T must be an object type or void.");
 
     constexpr offset_ptr() noexcept = default;
     constexpr offset_ptr(std::nullptr_t) noexcept : off_plus1_(0) {}
 
     SHM_FORCE_INLINE explicit offset_ptr(pointer p) noexcept { set(p); }
+
     SHM_FORCE_INLINE offset_ptr(const offset_ptr& other) noexcept { set(other.get()); }
     SHM_FORCE_INLINE offset_ptr& operator=(const offset_ptr& other) noexcept {
         if (this != &other) set(other.get());
@@ -136,32 +140,38 @@ public:
         const offset_type s = off_plus1_;
         if (SHM_UNLIKELY(s == 0)) return nullptr;
 
-        const auto b = Anchor::base(this);
-        // decode: (stored - 1)
+        const detail::uptr b = Anchor::base(this);
+
         if constexpr (std::is_signed_v<offset_type>) {
-            const auto off = static_cast<detail::iptr>(s) - 1;
+            const detail::iptr off = static_cast<detail::iptr>(s) - 1;
             return reinterpret_cast<pointer>(b + static_cast<detail::uptr>(off));
         } else {
-            const auto off = static_cast<detail::uptr>(s - 1);
+            const detail::uptr off = static_cast<detail::uptr>(s - 1);
             return reinterpret_cast<pointer>(b + off);
         }
     }
 
+    [[nodiscard]] SHM_FORCE_INLINE offset_type raw_storage() const noexcept { return off_plus1_; }
+
     [[nodiscard]] SHM_FORCE_INLINE explicit operator bool() const noexcept { return off_plus1_ != 0; }
 
-    [[nodiscard]] SHM_FORCE_INLINE reference operator*() const { return *get(); }
-    [[nodiscard]] SHM_FORCE_INLINE pointer operator->() const noexcept requires (!std::is_void_v<T>) { return get(); }
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE U& operator*() const noexcept { return *get(); }
 
-    [[nodiscard]] SHM_FORCE_INLINE offset_type raw_storage() const noexcept { return off_plus1_; }
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE U* operator->() const noexcept { return get(); }
 
 private:
     SHM_FORCE_INLINE void set(pointer p) noexcept {
         if (!p) { off_plus1_ = 0; return; }
 
-        const auto b = Anchor::base(this);
-        const auto t = detail::addr(p);
-        const auto diff = static_cast<detail::iptr>(t) - static_cast<detail::iptr>(b);
+        const detail::uptr b = Anchor::base(this);
+        const detail::uptr t = detail::addr(p);
+        const detail::iptr diff = static_cast<detail::iptr>(t) - static_cast<detail::iptr>(b);
 
+        // encode: stored = diff + 1 (0 reserved for null)
         if constexpr (std::is_signed_v<offset_type>) {
             SHM_ASSERT(diff != -1 && "diff == -1 would encode to 0 (reserved for null).");
             off_plus1_ = detail::narrow_checked<offset_type>(diff + 1);
@@ -179,10 +189,10 @@ class offset_ptr<T, segment_anchor<Tag>, OffsetT> {
 public:
     using element_type = T;
     using pointer      = T*;
-    using reference    = T&;
+    using reference    = std::add_lvalue_reference_t<T>; // void -> void (no ref)
     using offset_type  = OffsetT;
 
-    static_assert(std::is_object_v<T> || std::is_void_v<T>,
+    static_assert(detail::is_obj_or_void_v<T>,
                   "offset_ptr<T>: T must be an object type or void.");
 
     constexpr offset_ptr() noexcept = default;
@@ -207,34 +217,38 @@ public:
         const offset_type s = off_plus1_;
         if (SHM_UNLIKELY(s == 0)) return nullptr;
 
-        const auto b = segment_anchor<Tag>::base(nullptr);
+        const detail::uptr b = segment_anchor<Tag>::base(nullptr);
 
         if constexpr (std::is_signed_v<offset_type>) {
-            const auto off = static_cast<detail::iptr>(s) - 1;
+            const detail::iptr off = static_cast<detail::iptr>(s) - 1;
             return reinterpret_cast<pointer>(b + static_cast<detail::uptr>(off));
         } else {
-            const auto off = static_cast<detail::uptr>(s - 1);
+            const detail::uptr off = static_cast<detail::uptr>(s - 1);
             return reinterpret_cast<pointer>(b + off);
         }
     }
 
+    [[nodiscard]] SHM_FORCE_INLINE offset_type raw_storage() const noexcept { return off_plus1_; }
     [[nodiscard]] SHM_FORCE_INLINE explicit operator bool() const noexcept { return off_plus1_ != 0; }
 
-    [[nodiscard]] SHM_FORCE_INLINE reference operator*() const { return *get(); }
-    [[nodiscard]] SHM_FORCE_INLINE pointer operator->() const noexcept requires (!std::is_void_v<T>) { return get(); }
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE U& operator*() const noexcept { return *get(); }
 
-    [[nodiscard]] SHM_FORCE_INLINE offset_type raw_storage() const noexcept { return off_plus1_; }
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE U* operator->() const noexcept { return get(); }
 
 private:
     SHM_FORCE_INLINE void set(pointer p) noexcept {
         if (!p) { off_plus1_ = 0; return; }
 
-        const auto b = segment_anchor<Tag>::base(nullptr);
-        const auto t = detail::addr(p);
-        const auto diff = static_cast<detail::iptr>(t) - static_cast<detail::iptr>(b);
+        const detail::uptr b = segment_anchor<Tag>::base(nullptr);
+        const detail::uptr t = detail::addr(p);
+        const detail::iptr diff = static_cast<detail::iptr>(t) - static_cast<detail::iptr>(b);
 
         if constexpr (std::is_signed_v<offset_type>) {
-            SHM_ASSERT(diff != -1);
+            SHM_ASSERT(diff != -1 && "diff == -1 would encode to 0 (reserved for null).");
             off_plus1_ = detail::narrow_checked<offset_type>(diff + 1);
         } else {
             SHM_ASSERT(diff >= 0);
@@ -247,5 +261,46 @@ private:
 
 template <class T, class Tag, detail::offset_int OffsetT = std::uint32_t>
 using segment_offset_ptr = offset_ptr<T, segment_anchor<Tag>, OffsetT>;
+
+
+template <class T1, class A1, detail::offset_int O1,
+          class T2, class A2, detail::offset_int O2>
+requires (detail::is_obj_or_void_v<T1> && detail::is_obj_or_void_v<T2>)
+SHM_FORCE_INLINE bool operator==(const offset_ptr<T1, A1, O1>& a,
+                                 const offset_ptr<T2, A2, O2>& b) noexcept {
+    return static_cast<const void*>(a.get()) == static_cast<const void*>(b.get());
+}
+
+template <class T1, class A1, detail::offset_int O1,
+          class T2, class A2, detail::offset_int O2>
+requires (detail::is_obj_or_void_v<T1> && detail::is_obj_or_void_v<T2>)
+SHM_FORCE_INLINE bool operator!=(const offset_ptr<T1, A1, O1>& a,
+                                 const offset_ptr<T2, A2, O2>& b) noexcept {
+    return !(a == b);
+}
+
+template <class T, class A, detail::offset_int O>
+requires (detail::is_obj_or_void_v<T>)
+SHM_FORCE_INLINE bool operator==(const offset_ptr<T, A, O>& a, std::nullptr_t) noexcept {
+    return a.get() == nullptr;
+}
+
+template <class T, class A, detail::offset_int O>
+requires (detail::is_obj_or_void_v<T>)
+SHM_FORCE_INLINE bool operator==(std::nullptr_t, const offset_ptr<T, A, O>& a) noexcept {
+    return a.get() == nullptr;
+}
+
+template <class T, class A, detail::offset_int O>
+requires (detail::is_obj_or_void_v<T>)
+SHM_FORCE_INLINE bool operator!=(const offset_ptr<T, A, O>& a, std::nullptr_t) noexcept {
+    return !(a == nullptr);
+}
+
+template <class T, class A, detail::offset_int O>
+requires (detail::is_obj_or_void_v<T>)
+SHM_FORCE_INLINE bool operator!=(std::nullptr_t, const offset_ptr<T, A, O>& a) noexcept {
+    return !(a == nullptr);
+}
 
 } // namespace shm
