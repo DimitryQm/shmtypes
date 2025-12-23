@@ -45,7 +45,7 @@ jobs:
           #include "shmTypes.hpp"
           int main() { return 0; }
           CPP
-          "${{ matrix.cxx }}" ${{ matrix.cxxflags }} -I. -c build_header_sanity.cpp -o build_header_sanity.o
+          "${{ matrix.cxx }}" ${{ matrix.cxxflags }} -I. -Iinclude -c build_header_sanity.cpp -o build_header_sanity.o
 
       - name: Build examples (POSIX)
         if: matrix.os != 'windows-latest'
@@ -62,7 +62,43 @@ jobs:
           for f in "${files[@]}"; do
             out="build/examples/$(basename "${f%.*}")"
             echo "Compiling ${f} -> ${out}"
-            "${{ matrix.cxx }}" ${{ matrix.cxxflags }} -I. -o "${out}" "${f}"
+            "${{ matrix.cxx }}" ${{ matrix.cxxflags }} -I. -Iinclude -o "${out}" "${f}"
+          done
+
+      - name: Build and run tests (POSIX)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/tests
+          mapfile -t files < <(find tests -type f -name '*.cpp' 2>/dev/null | sort || true)
+          if (( ${#files[@]} == 0 )); then
+            echo "No tests/*.cpp found; skipping."
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            out="build/tests/$(basename "${f%.*}")"
+            echo "Compiling ${f} -> ${out}"
+            "${{ matrix.cxx }}" ${{ matrix.cxxflags }} -I. -Iinclude -o "${out}" "${f}"
+            echo "Running ${out}"
+            "${out}"
+          done
+
+      - name: Build benchmarks (compile only, POSIX)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/benchmark
+          mapfile -t files < <(find benchmark -type f -name '*.cpp' 2>/dev/null | sort || true)
+          if (( ${#files[@]} == 0 )); then
+            echo "No benchmark/*.cpp found; skipping."
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            out="build/benchmark/$(basename "${f%.*}")"
+            echo "Compiling ${f} -> ${out}"
+            "${{ matrix.cxx }}" ${{ matrix.cxxflags }} -I. -Iinclude -o "${out}" "${f}"
           done
 
       - name: Header-only compile sanity (MSVC)
@@ -74,7 +110,7 @@ jobs:
           #include "shmTypes.hpp"
           int main() { return 0; }
           '@ | Out-File -Encoding ascii build_header_sanity.cpp
-          cl /nologo /std:c++20 /O2 /W4 /WX /permissive- /EHsc /I. /c build_header_sanity.cpp /Fo:build_header_sanity.obj
+          cl /nologo /std:c++20 /O2 /W4 /WX /permissive- /EHsc /I. /Iinclude /c build_header_sanity.cpp /Fo:build_header_sanity.obj
 
       - name: Build examples (MSVC)
         if: matrix.os == 'windows-latest'
@@ -90,5 +126,42 @@ jobs:
           foreach ($f in $files) {
             $out = "build/examples/$($f.BaseName).exe"
             Write-Host "Compiling $($f.FullName) -> $out"
-            cl /nologo /std:c++20 /O2 /W4 /WX /permissive- /EHsc /I. /Fe:$out $f.FullName
+            cl /nologo /std:c++20 /O2 /W4 /WX /permissive- /EHsc /I. /Iinclude /Fe:$out $f.FullName
+          }
+
+      - name: Build and run tests (MSVC)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path build/tests | Out-Null
+          $files = Get-ChildItem -Path tests -Recurse -Filter *.cpp -ErrorAction SilentlyContinue | Sort-Object FullName
+          if (-not $files) {
+            Write-Host "No tests/**/*.cpp found; skipping."
+            exit 0
+          }
+          foreach ($f in $files) {
+            $out = "build/tests/$($f.BaseName).exe"
+            Write-Host "Compiling $($f.FullName) -> $out"
+            cl /nologo /std:c++20 /O2 /W4 /WX /permissive- /EHsc /I. /Iinclude /Fe:$out $f.FullName
+            Write-Host "Running $out"
+            & $out
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Build benchmarks (compile only, MSVC)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path build/benchmark | Out-Null
+          $files = Get-ChildItem -Path benchmark -Recurse -Filter *.cpp -ErrorAction SilentlyContinue | Sort-Object FullName
+          if (-not $files) {
+            Write-Host "No benchmark/**/*.cpp found; skipping."
+            exit 0
+          }
+          foreach ($f in $files) {
+            $out = "build/benchmark/$($f.BaseName).exe"
+            Write-Host "Compiling $($f.FullName) -> $out"
+            cl /nologo /std:c++20 /O2 /W4 /WX /permissive- /EHsc /I. /Iinclude /Fe:$out $f.FullName
           }
