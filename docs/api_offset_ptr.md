@@ -2,7 +2,7 @@
 
 `offset_ptr` is a relocatable reference type for position-independent data stored inside a contiguous region such as shared memory or a memory-mapped file. It stores an integral displacement rather than a process-local address, and it reconstructs a usable `T*` on demand by adding that displacement to an anchor-defined base.
 
-The intent of this document is to specify the user-visible API surface and the semantics you can rely on. It is not a tutorial and it does not attempt to soften the constraints that fall out of the model.
+The intent of this document is to specify the user-visible API surface and the semantics you can rely on. It is not a tutorial and it does not attempt to soften the constraints that fall out of the model. Where code is shown, it is shown as an executable witness of the contract, not as a motivational example.
 
 ## Type and Parameters
 
@@ -10,7 +10,7 @@ The primary type is `offset_ptr<T, Anchor, OffsetT>`.
 
 `T` is the pointed-to type. The library does not make arbitrary `T` safe for shared memory; `T` should be chosen according to the project’s shared-memory safety rules. In most production designs, `T` is standard-layout and trivially copyable, and it does not contain raw pointers, references, vtables, or allocator-owning standard library types.
 
-`Anchor` defines the coordinate system in which the stored displacement is interpreted. The anchor is the semantic lever that determines when relocation is guaranteed to work and when it is not. The two canonical anchors are `self_anchor` and `segment_anchor<Tag>`.
+`Anchor` defines the coordinate system in which the stored displacement is interpreted. The anchor is the semantic lever that determines when relocation is guaranteed to work and when it is not. The canonical anchors are `self_anchor` and `segment_anchor<Tag>`. The library may also provide specialized anchors whose copy and relocation behavior differs; treat those as separate pointer species and do not assume that a type named `offset_ptr` necessarily has ordinary pointer-like copy semantics unless the specialization specifies it.
 
 `OffsetT` is the stored integer type that encodes the displacement. This choice is a storage and performance trade. A 32-bit offset is typically preferable when the segment is smaller than 4 GiB because it shrinks node size and improves cache density. A 64-bit offset removes practical size limits at the cost of larger nodes and higher memory bandwidth usage. Signed offsets permit backward references; unsigned offsets constrain references to be forward from the chosen base. The library treats `OffsetT` as the representation type, and if you persist blobs long-term you should freeze this choice as part of your on-disk or on-wire schema.
 
@@ -36,6 +36,8 @@ In implementations that specialize for segment anchoring, copying and moving are
 
 When using `segment_anchor<Tag>`, each process that maps the region must set the base pointer before dereferencing any segment-relative `offset_ptr` stored in that region. The base pointer is not stored in the shared bytes; it is process-local state.
 
+The base pointer must be the base that the `offset_ptr` displacement was defined against. In the standard usage pattern for this library, that base is the start address of the mapped view that contains the bytes you are interpreting as the segment.
+
 If your application spans multiple shared libraries on Windows, be aware that header-only inline statics may be duplicated per module. If the segment base is stored as an inline static inside a header and you call `segment_base<Tag>::set()` in one DLL but decode in another DLL, you can end up with inconsistent bases. In such deployments, centralize the base storage in a single module or provide an exported setter/getter so every consumer resolves the same base pointer.
 
 ## Null Representation and the Self-Reference Trade
@@ -45,6 +47,142 @@ If your application spans multiple shared libraries on Windows, be aware that he
 The common encoding is “offset plus one.” The stored integer is `offset + 1` and a stored value of `0` means null. On decode, the effective offset is `stored - 1`. This scheme implies a specific trade: an offset of zero is unavailable because it collides with null. In practical terms, a pointer cannot point to the anchor base with an offset of zero. In self-anchored mode this means the pointer cannot point to itself, because that would require an offset of zero. This is an intentional trade for space efficiency and fast null checks.
 
 If you need to represent self-references or base-pointing references, represent them explicitly at a higher level. Do not assume `offset_ptr` can express every degenerate pointer pattern.
+
+## Mechanically Complete Usage Examples
+
+The library’s contract is primarily stated in terms of offsets and anchors. The code below exists to remove ambiguity about the intended calling sequence and the intended relocation behavior. The examples are written in terms of ordinary heap buffers so they can be compiled and executed without OS-specific mapping code, but the semantics are the same as `mmap` or Windows file mapping: a contiguous byte region that may appear at different virtual addresses in different processes.
+
+### Segment-relative graph construction and relocation by raw byte copy
+
+This example constructs a small linked structure in one region, then copies the bytes to a second region at a different address, sets the segment base for that region, and traverses the structure successfully without pointer fixups. The copy is a raw `memcpy` of the region bytes and the only per-process action is re-establishing the segment base.
+
+```cpp
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <new>
+
+#include "shmTypes.hpp"
+
+namespace demo {
+
+struct MySegTag {};
+
+struct Node {
+    std::int32_t value;
+    shm::segment_offset_ptr<Node, MySegTag, std::uint32_t> next;
+};
+
+struct SegmentHeader {
+    shm::segment_offset_ptr<Node, MySegTag, std::uint32_t> head;
+};
+
+} // namespace demo
+
+int main() {
+    using namespace demo;
+
+    constexpr std::size_t kBytes = 4096;
+
+    std::byte* regionA = static_cast<std::byte*>(::operator new(kBytes, std::align_val_t(64)));
+    std::byte* regionB = static_cast<std::byte*>(::operator new(kBytes, std::align_val_t(64)));
+    std::memset(regionA, 0, kBytes);
+    std::memset(regionB, 0, kBytes);
+
+    shm::segment_base<MySegTag>::set(regionA);
+
+    auto* hdrA = ::new (regionA) SegmentHeader{};
+    auto* n1A  = ::new (regionA + 128) Node{.value = 1, .next = nullptr};
+    auto* n2A  = ::new (regionA + 256) Node{.value = 2, .next = nullptr};
+    auto* n3A  = ::new (regionA + 384) Node{.value = 3, .next = nullptr};
+
+    n1A->next = n2A;
+    n2A->next = n3A;
+    hdrA->head = n1A;
+
+    assert(hdrA->head.get() == n1A);
+    assert(hdrA->head->next.get() == n2A);
+    assert(hdrA->head->next->next.get() == n3A);
+
+    std::memcpy(regionB, regionA, kBytes);
+
+    shm::segment_base<MySegTag>::set(regionB);
+
+    auto* hdrB = reinterpret_cast<SegmentHeader*>(regionB);
+
+    Node* cur = hdrB->head.get();
+    assert(cur != nullptr);
+    assert(cur->value == 1);
+
+    cur = cur->next.get();
+    assert(cur != nullptr);
+    assert(cur->value == 2);
+
+    cur = cur->next.get();
+    assert(cur != nullptr);
+    assert(cur->value == 3);
+
+    cur = cur->next.get();
+    assert(cur == nullptr);
+
+    ::operator delete(regionA, std::align_val_t(64));
+    ::operator delete(regionB, std::align_val_t(64));
+}
+````
+
+This example assumes that `regionA + 128`, `regionA + 256`, and `regionA + 384` are aligned for `Node`. If you choose addresses that violate alignment, you have undefined behavior regardless of how correct the offset encoding is.
+
+This example assumes that `Node` and `SegmentHeader` are resident-safe types under your project’s memory model. If you put vtables, raw pointers, or allocator-owned container state in those types, the example becomes mechanically incorrect even though the offsets still decode.
+
+### Self-relative copy semantics are rebased, not bitwise
+
+Self-relative anchoring has the property that the decoding base is the address of the `offset_ptr` field itself. That implies that a correct copy operation cannot be a bitwise copy when the destination pointer object resides at a different address. The library therefore rebases on copy by decoding the referent and re-encoding relative to the destination object.
+
+The example below shows that the referent is preserved under copy even though the stored integer encoding generally changes.
+
+```cpp
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+
+#include "shmTypes.hpp"
+
+struct SelfNode {
+    std::int32_t value;
+    shm::offset_ptr<SelfNode, shm::self_anchor, std::int32_t> next;
+};
+
+int main() {
+    alignas(SelfNode) std::byte bufA[sizeof(SelfNode) * 2]{};
+    alignas(SelfNode) std::byte bufB[sizeof(SelfNode) * 2]{};
+
+    auto* a1 = reinterpret_cast<SelfNode*>(bufA + 0);
+    auto* a2 = reinterpret_cast<SelfNode*>(bufA + sizeof(SelfNode));
+    a1->value = 10;
+    a2->value = 20;
+    a1->next  = a2;
+
+    auto raw_before = a1->next.raw_storage();
+
+    auto* b1 = reinterpret_cast<SelfNode*>(bufB + 0);
+    auto* b2 = reinterpret_cast<SelfNode*>(bufB + sizeof(SelfNode));
+    b1->value = 10;
+    b2->value = 20;
+
+    b1->next = a1->next;
+
+    assert(b1->next.get() == reinterpret_cast<SelfNode*>(reinterpret_cast<std::byte*>(b1) + sizeof(SelfNode)));
+    assert(b1->next->value == 20);
+
+    auto raw_after = b1->next.raw_storage();
+    assert(raw_before != 0);
+    assert(raw_after  != 0);
+    assert(raw_before != raw_after);
+}
+```
+
+The final assertion comparing `raw_storage()` is not a semantic requirement; it is a demonstration that rebasing generally changes the encoding. What is required is that the referent be preserved. Rely on referent semantics, not on raw encoding identity, when you use self-relative anchoring.
 
 ## API Surface
 
@@ -94,7 +232,7 @@ Reads are const-correct. Writes are not atomic.
 
 Calling `get()` concurrently from multiple threads is safe only if no thread writes to the same `offset_ptr` concurrently. Updating an `offset_ptr` from multiple threads or reading while another thread writes without synchronization is a data race and therefore undefined behavior.
 
-If you need concurrent publication of pointers, wrap the stored representation in an atomic and define a publication protocol with release and acquire semantics. The library does not implicitly make any operation atomic and does not insert memory fences.
+If you need concurrent publication of pointers, the mechanically relevant fact is that the stored representation is an integer type. A publication protocol therefore means publishing that integer with release semantics and reading it with acquire semantics. This library does not provide an atomic `offset_ptr` wrapper, because any such wrapper must also specify how publication relates to object initialization and lifetime in your segment.
 
 Across processes, the same rules apply. The fact that memory is shared does not relax the C++ data race rules; it simply makes violations harder to debug.
 
@@ -131,4 +269,3 @@ Do not persist raw pointers returned by `get()`.
 Do not store polymorphic objects in the segment.
 
 Do not update `offset_ptr` concurrently without synchronization.
-
