@@ -104,11 +104,8 @@ static_assert(std::is_trivially_copyable_v<Node> == false || true, "Node may be 
 
 static int fuzz_one(const std::uint8_t* data, std::size_t size) {
     using Alloc = shm::linear_allocator<FuzzTag, std::uint32_t>;
-
-    // Keep this moderate so CI runs it quickly; real fuzzers can scale it up.
     constexpr std::size_t kArenaSize = 1ull * 1024ull * 1024ull;
 
-    // Page-align arenas so relocation preserves power-of-two alignments <= page size.
     std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
     if (page == 0 || (page & (page - 1)) != 0) page = 4096;
 
@@ -133,8 +130,6 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
     std::vector<Block> blocks;
     blocks.reserve(4096);
 
-    // We'll also build a simple singly-linked list using segment handles, to ensure
-    // that object creation + pointer encoding remains valid across resets and relocations.
     using H = typename Alloc::template handle<Node>;
     H head(nullptr);
     std::size_t nodes = 0;
@@ -142,22 +137,17 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
     const std::uint8_t* p = data;
     const std::uint8_t* end = data + size;
 
-    // Limit operations so non-fuzzer runs remain bounded and fast.
     const std::size_t max_ops = 4000;
     for (std::size_t op_i = 0; op_i < max_ops && p < end; ++op_i) {
         const std::uint8_t op = read_u8(p, end);
 
-        // Bias: allocate is common, reset/relocate are rarer but exercised.
         switch (op % 8) {
             case 0:
             case 1:
             case 2: {
-                // alloc bytes with alignment
                 const std::uint32_t r = read_u32(p, end);
                 const std::size_t n = static_cast<std::size_t>(r & 0x3FFFu); // 0..16383
                 const std::size_t al = pick_align(read_u32(p, end));
-
-                // Model the allocator: minimal aligned address from current cursor.
                 const std::uintptr_t cur_addr = base_live + static_cast<std::uintptr_t>(model_cursor);
                 const std::uintptr_t aligned = align_up_addr(cur_addr, al);
                 const std::size_t start = static_cast<std::size_t>(aligned - base_live);
@@ -184,26 +174,21 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
 
                 blocks.push_back(Block{start, n, al});
 
-                // Touch it to catch overlaps under ASan/MSan and to exercise addressability.
                 std::memset(got, static_cast<int>(op_i & 0xFF), n);
                 break;
             }
 
             case 3: {
-                // make_handle Node, link it to the head (tests allocator factory + offset_ptr mechanics)
                 const std::uint32_t v = read_u32(p, end);
 
                 H node = alloc.template make_handle<Node>(Node{v, head});
                 if (!node) {
-                    // Must be OOM; cursor unchanged in the model if we can predict it.
-                    // We cannot precisely model make_handle without knowing its internal alloc(),
-                    // but in this library it should be alloc(sizeof(Node), alignof(Node)).
+
                     const std::uintptr_t cur_addr = base_live + static_cast<std::uintptr_t>(model_cursor);
                     const std::uintptr_t aligned = align_up_addr(cur_addr, alignof(Node));
                     const std::size_t start = static_cast<std::size_t>(aligned - base_live);
 
                     if (start <= kArenaSize && start <= kArenaSize - sizeof(Node)) {
-                        // If it would have fit, failing is a bug.
                         CHECK(false);
                     }
                     CHECK(alloc.used() == model_cursor);
@@ -215,8 +200,6 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
                 CHECK(uaddr(np) >= base_live);
                 CHECK(uaddr(np) < base_live + kArenaSize);
                 CHECK((uaddr(np) % alignof(Node)) == 0);
-
-                // Model cursor advance for this allocation.
                 const std::uintptr_t cur_addr = base_live + static_cast<std::uintptr_t>(model_cursor);
                 const std::uintptr_t aligned = align_up_addr(cur_addr, alignof(Node));
                 const std::size_t start = static_cast<std::size_t>(aligned - base_live);
@@ -226,7 +209,6 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
 
                 blocks.push_back(Block{start, sizeof(Node), alignof(Node)});
 
-                // Validate the list head and single hop.
                 CHECK(np->value == v);
                 if (head) {
                     Node* hp = np->next.get();
@@ -241,7 +223,6 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
             }
 
             case 4: {
-                // reset (frame boundary)
                 alloc.reset();
                 model_cursor = 0;
                 blocks.clear();
@@ -251,7 +232,6 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
             }
 
             case 5: {
-                // secure_reset if available; otherwise normal reset.
                 if constexpr (HasSecureReset<Alloc>) {
                     alloc.secure_reset();
                 } else {
@@ -268,19 +248,13 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
                 const std::size_t used = alloc.used();
                 CHECK(used == model_cursor);
             
-                // Copy used prefix into arena_b
                 std::memset(arena_b, 0, kArenaSize);
                 std::memcpy(arena_b, arena_a, used);
-            
-                // Make arena_b the new live arena (swap pointers)
+        
                 std::swap(arena_a, arena_b);
-            
-                // Rebuild allocator on the new live arena.
-                // (Your allocator sets segment_base<Tag>::set(arena_a) internally.)
                 alloc.~Alloc();
                 new (&alloc) Alloc(arena_a, kArenaSize);
             
-                // Reserve the already-used prefix so allocator cursor matches the copied state.
                 if (used != 0) {
                     void* r = alloc.alloc(used, 1);
                     CHECK(r != nullptr);
@@ -292,7 +266,6 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
                 CHECK(alloc.used() == used);
                 CHECK(model_cursor == used);
             
-                // Verify list integrity (bounded).
                 std::size_t walked = 0;
                 for (Node* cur = head.get(); cur && walked < 128; cur = cur->next.get()) {
                     CHECK(uaddr(cur) >= base_live);
@@ -305,7 +278,6 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
             
 
             case 7: {
-                // Consistency check: no overlaps and all aligned.
                 verify_no_overlap_and_within(blocks, kArenaSize, base_live);
                 CHECK(alloc.used() == model_cursor);
                 break;
@@ -313,7 +285,6 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
         }
     }
 
-    // End-state invariants.
     CHECK(alloc.used() == model_cursor);
     verify_no_overlap_and_within(blocks, kArenaSize, base_live);
 
@@ -324,7 +295,6 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
 
 } // namespace
 
-// LibFuzzer / OSS-Fuzz detection.
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
 #define SHM_LIBFUZZER 1
 #elif defined(__has_feature)
@@ -341,12 +311,9 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 
 #else
 
-// Non-fuzzer build: run a bounded deterministic “mini-fuzz” so CI can execute it safely.
 int main() {
-    // A small fixed corpus plus a cheap PRNG expansion.
     std::vector<std::uint8_t> blob(4096);
 
-    // Seeded pattern: stable across platforms, enough entropy to exercise paths.
     std::uint64_t s = 0x123456789ABCDEF0ull;
     auto next = [&]() {
         s = s * 6364136223846793005ull + 1442695040888963407ull;
@@ -360,7 +327,6 @@ int main() {
         fuzz_one(blob.data(), blob.size());
     }
 
-    // Also exercise tiny inputs (common fuzz edge case).
     for (std::size_t n = 0; n < 32; ++n) {
         fuzz_one(blob.data(), n);
     }
