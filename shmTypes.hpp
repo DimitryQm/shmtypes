@@ -942,9 +942,9 @@ static inline void nanosleep_backoff_(std::size_t attempt) noexcept {
             sa.bInheritHandle = FALSE;
             return &sa;
         }
-    };
+    };  
+    #endif
 
-#endif
 #endif
 } // namespace detail::seg
 
