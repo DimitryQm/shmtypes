@@ -182,28 +182,3 @@ A segment that uses `linear_allocator` typically has a fixed header that stores 
 A mechanically correct design stores only segment-relative handles inside the shared bytes. Raw pointers returned by `alloc` and `allocate` are permitted only as transient local variables within a process. If you write raw pointers into the segment, you have violated the position-independent representation model, regardless of whether the pointers “happen to work” in one process.
 
 If you allocate and construct an object and then store a handle to it into shared state that other participants may read, you must define a publication protocol. Allocation success means only that the storage is reserved. It does not imply that the object is visible as fully initialized to other observers. The allocator does not provide this protocol because it must be consistent with your graph invariants and mutation policy.
-
-## Sanitizer evidence and what it does and does not establish
-
-You exercised the allocator under contention with ThreadSanitizer and under AddressSanitizer plus UndefinedBehaviorSanitizer. The observed outputs are reproduced here as operational evidence of the tested behavior.
-
-```text
-g++ -std=c++20 -O1 -g -fsanitize=thread -fno-omit-frame-pointer main.cpp -o test_tsan -pthread
-./test_tsan
-[stress] random_pow2_align threads=32 iters=10000 success=319648 fail=352 used=49034846 / 67108864
-[stress] random_mixed_align threads=32 iters=10000 success=319648 fail=352 used=48957493 / 67108864
-[stress] hot_contention_fixed_size threads=32 iters_per_thread=6250 allocations=200000 used=12800000 / 67108864
-
-g++ -std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer main.cpp -o test_asan -pthread
-./test_asan
-[stress] random_pow2_align threads=32 iters=10000 success=319648 fail=352 used=49035786 / 67108864
-[stress] random_mixed_align threads=32 iters=10000 success=319648 fail=352 used=48947338 / 67108864
-[stress] hot_contention_fixed_size threads=32 iters_per_thread=6250 allocations=200000 used=12800000 / 67108864
-```
-
-These results are consistent with the allocator’s stated behavior under a finite capacity budget. The failure counts indicate allocation requests that did not fit. The `used` values are cursor values and therefore include alignment padding. The hot-contention test demonstrates that many threads can contend on the same cursor and still obtain disjoint reservations.
-
-These runs establish that the allocator’s cursor update protocol does not produce data races in the tested harness and does not write out of bounds in the tested harness. They do not establish any correctness property for the objects placed into arena memory, and they do not establish correct cross-process publication semantics. Those properties are above the allocator and must be specified and enforced by the segment’s construction and mutation rules.
-
-```
-```
