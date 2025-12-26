@@ -1,4 +1,20 @@
 #pragma once
+
+#if defined(_WIN32) || defined(__MSYS__)
+  #define SHM_PLATFORM_WIN32 1
+#else
+  #define SHM_PLATFORM_WIN32 0
+#endif
+
+#if !SHM_PLATFORM_WIN32
+  #ifndef _POSIX_C_SOURCE
+    #define _POSIX_C_SOURCE 200809L
+  #endif
+  #ifndef _XOPEN_SOURCE
+    #define _XOPEN_SOURCE 700
+  #endif
+#endif
+
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +28,29 @@
 #include <string_view>
 #include <system_error>
 #include <stdexcept>
+
+
+#if !SHM_PLATFORM_WIN32
+  #include <cerrno>
+  #include <fcntl.h>
+  #include <sys/mman.h>
+  #include <sys/stat.h>
+  #include <sys/types.h>
+  #include <time.h>
+  #include <unistd.h>
+#else
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+
+  #if defined(SHM_WIN32_USE_SDDL_DACL)
+    #include <sddl.h>
+  #endif
+#endif
 
 #if defined(_MSC_VER)
   #define SHM_FORCE_INLINE __forceinline
@@ -37,30 +76,6 @@
   #define SHM_UNLIKELY(x) (x)
 #endif
 
-#if !defined(_WIN32)
-  #include <cerrno>
-  #include <fcntl.h>
-  #include <sys/mman.h>
-  #include <sys/stat.h>
-  #include <sys/types.h>
-  #include <time.h>
-  #include <unistd.h>
-#endif
-
-#ifdef _WIN32
-  #ifndef NOMINMAX
-    #define NOMINMAX
-  #endif
-  #ifndef WIN32_LEAN_AND_MEAN
-    #define WIN32_LEAN_AND_MEAN
-  #endif
-  #include <windows.h>
-#if defined(_WIN32) && defined(SHM_WIN32_USE_SDDL_DACL)
-  #include <sddl.h>
-#endif
-
-#endif
-
 #ifndef SHM_OFFSET_PTR_DEBUG
   #define SHM_OFFSET_PTR_DEBUG 0
 #endif
@@ -72,30 +87,29 @@
   #define SHM_ASSERT(x) ((void)0)
 #endif
 
-#if defined(_WIN32)
+#if SHM_PLATFORM_WIN32
 
-#ifndef SHM_WIN32_OBJECT_NAMESPACE
-  #define SHM_WIN32_OBJECT_NAMESPACE L"Local\\"
+  #ifndef SHM_WIN32_OBJECT_NAMESPACE
+    #define SHM_WIN32_OBJECT_NAMESPACE L"Local\\"
+  #endif
+
+  #ifndef SHM_WIN32_ZERO_ON_CREATE
+    #define SHM_WIN32_ZERO_ON_CREATE 1
+  #endif
+
+  #ifndef SHM_WIN32_PREFETCH_BYTES_ON_OPEN
+    #define SHM_WIN32_PREFETCH_BYTES_ON_OPEN 0
+  #endif
+
+  #ifndef SHM_WIN32_TRY_VIRTUAL_LOCK
+    #define SHM_WIN32_TRY_VIRTUAL_LOCK 0
+  #endif
+
+  #ifndef SHM_WIN32_MAP_ACCESS
+    #define SHM_WIN32_MAP_ACCESS (FILE_MAP_READ | FILE_MAP_WRITE)
+  #endif
+
 #endif
-
-#ifndef SHM_WIN32_ZERO_ON_CREATE
-  #define SHM_WIN32_ZERO_ON_CREATE 1
-#endif
-
-#ifndef SHM_WIN32_PREFETCH_BYTES_ON_OPEN
-  #define SHM_WIN32_PREFETCH_BYTES_ON_OPEN 0
-#endif
-
-#ifndef SHM_WIN32_TRY_VIRTUAL_LOCK
-  #define SHM_WIN32_TRY_VIRTUAL_LOCK 0
-#endif
-
-#ifndef SHM_WIN32_MAP_ACCESS
-  #define SHM_WIN32_MAP_ACCESS (FILE_MAP_READ | FILE_MAP_WRITE)
-#endif
-
-#endif
-
 
 namespace shm {
 
@@ -227,6 +241,99 @@ public:
     template <class U = T>
     requires (!std::is_void_v<U>)
     [[nodiscard]] SHM_FORCE_INLINE U* operator->() const noexcept { return get(); }
+    using difference_type = std::ptrdiff_t;
+
+    template <class U>
+    using rebind = offset_ptr<U, Anchor, OffsetT>; 
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator++() noexcept { *this += 1; return *this; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr operator++(int) noexcept { offset_ptr tmp(*this); ++(*this); return tmp; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator--() noexcept { *this -= 1; return *this; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr operator--(int) noexcept { offset_ptr tmp(*this); --(*this); return tmp; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator+=(difference_type n) noexcept {
+        pointer p = get();
+        p += n;
+        *this = offset_ptr(p);
+        return *this;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator-=(difference_type n) noexcept {
+        pointer p = get();
+        p -= n;
+        *this = offset_ptr(p);
+        return *this;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE offset_ptr operator+(difference_type n) const noexcept {
+        offset_ptr tmp(*this);
+        tmp += n;
+        return tmp;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE offset_ptr operator-(difference_type n) const noexcept {
+        offset_ptr tmp(*this);
+        tmp -= n;
+        return tmp;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE difference_type operator-(const offset_ptr& other) const noexcept {
+        return get() - other.get();
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE U& operator[](difference_type i) const noexcept {
+        return *(get() + i);
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    static SHM_FORCE_INLINE offset_ptr pointer_to(U& r) noexcept {
+        return offset_ptr(&r);
+    }
+
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator<(const offset_ptr& a, const offset_ptr& b) noexcept {
+        return a.get() < b.get();
+    }
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator>(const offset_ptr& a, const offset_ptr& b) noexcept {
+        return b < a;
+    }
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator<=(const offset_ptr& a, const offset_ptr& b) noexcept {
+        return !(b < a);
+    }
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator>=(const offset_ptr& a, const offset_ptr& b) noexcept {
+        return !(a < b);
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] friend SHM_FORCE_INLINE offset_ptr operator+(difference_type n, offset_ptr p) noexcept {
+        p += n;
+        return p;
+    }
+
 
 private:
     SHM_FORCE_INLINE void set(pointer p) noexcept {
@@ -254,8 +361,11 @@ class offset_ptr<T, segment_anchor<Tag>, OffsetT> {
 public:
     using element_type = T;
     using pointer      = T*;
-    using reference = std::add_lvalue_reference_t<T>;
+    using reference    = std::add_lvalue_reference_t<T>;
     using offset_type  = OffsetT;
+
+    using difference_type = std::ptrdiff_t;
+    template <class U> using rebind = offset_ptr<U, segment_anchor<Tag>, OffsetT>;
 
     static_assert(detail::is_obj_or_void_v<T>,
                   "offset_ptr<T>: T must be an object type or void.");
@@ -304,6 +414,86 @@ public:
     requires (!std::is_void_v<U>)
     [[nodiscard]] SHM_FORCE_INLINE U* operator->() const noexcept { return get(); }
 
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator++() noexcept { *this += 1; return *this; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr operator++(int) noexcept { offset_ptr tmp(*this); ++(*this); return tmp; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator--() noexcept { *this -= 1; return *this; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr operator--(int) noexcept { offset_ptr tmp(*this); --(*this); return tmp; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator+=(difference_type n) noexcept {
+        pointer p = get();
+        p += n;
+        *this = offset_ptr(p);
+        return *this;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator-=(difference_type n) noexcept {
+        pointer p = get();
+        p -= n;
+        *this = offset_ptr(p);
+        return *this;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE offset_ptr operator+(difference_type n) const noexcept {
+        offset_ptr tmp(*this);
+        tmp += n;
+        return tmp;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE offset_ptr operator-(difference_type n) const noexcept {
+        offset_ptr tmp(*this);
+        tmp -= n;
+        return tmp;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE difference_type operator-(const offset_ptr& other) const noexcept {
+        return get() - other.get();
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE U& operator[](difference_type i) const noexcept {
+        return *(get() + i);
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    static SHM_FORCE_INLINE offset_ptr pointer_to(U& r) noexcept {
+        return offset_ptr(&r);
+    }
+
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator<(const offset_ptr& a, const offset_ptr& b) noexcept { return a.get() < b.get(); }
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator>(const offset_ptr& a, const offset_ptr& b) noexcept { return b < a; }
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator<=(const offset_ptr& a, const offset_ptr& b) noexcept { return !(b < a); }
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator>=(const offset_ptr& a, const offset_ptr& b) noexcept { return !(a < b); }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] friend SHM_FORCE_INLINE offset_ptr operator+(difference_type n, offset_ptr p) noexcept {
+        p += n;
+        return p;
+    }
+
 private:
     SHM_FORCE_INLINE void set(pointer p) noexcept {
         if (!p) { off_plus1_ = 0; return; }
@@ -329,8 +519,11 @@ class offset_ptr<T, self_reloc_anchor, OffsetT> {
 public:
     using element_type = T;
     using pointer      = T*;
-    using reference = std::add_lvalue_reference_t<T>;
+    using reference    = std::add_lvalue_reference_t<T>;
     using offset_type  = OffsetT;
+
+    using difference_type = std::ptrdiff_t;
+    template <class U> using rebind = offset_ptr<U, self_reloc_anchor, OffsetT>;
 
     static_assert(detail::is_obj_or_void_v<T>,
                   "offset_ptr<T>: T must be an object type or void.");
@@ -338,17 +531,21 @@ public:
     constexpr offset_ptr() noexcept = default;
     constexpr offset_ptr(std::nullptr_t) noexcept : off_plus1_(0) {}
     SHM_FORCE_INLINE explicit offset_ptr(pointer p) noexcept { set(p); }
+    SHM_FORCE_INLINE offset_ptr(const offset_ptr& other) noexcept { set(other.get()); }
+    SHM_FORCE_INLINE offset_ptr& operator=(const offset_ptr& other) noexcept {
+        if (this != &other) set(other.get());
+        return *this;
+    }
 
-    offset_ptr(const offset_ptr&) noexcept = default;
     offset_ptr(offset_ptr&&) noexcept = default;
-    offset_ptr& operator=(const offset_ptr&) noexcept = default;
     offset_ptr& operator=(offset_ptr&&) noexcept = default;
     ~offset_ptr() = default;
 
     template <class U>
     requires (std::is_convertible_v<U*, T*>)
-    SHM_FORCE_INLINE offset_ptr(const offset_ptr<U, self_reloc_anchor, OffsetT>& other) noexcept
-        : off_plus1_(other.raw_storage()) {}
+    SHM_FORCE_INLINE offset_ptr(const offset_ptr<U, self_reloc_anchor, OffsetT>& other) noexcept {
+        set(other.get());
+    }
 
     SHM_FORCE_INLINE offset_ptr& operator=(pointer p) noexcept { set(p); return *this; }
     SHM_FORCE_INLINE offset_ptr& operator=(std::nullptr_t) noexcept { off_plus1_ = 0; return *this; }
@@ -379,6 +576,86 @@ public:
     requires (!std::is_void_v<U>)
     [[nodiscard]] SHM_FORCE_INLINE U* operator->() const noexcept { return get(); }
 
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator++() noexcept { *this += 1; return *this; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr operator++(int) noexcept { offset_ptr tmp(*this); ++(*this); return tmp; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator--() noexcept { *this -= 1; return *this; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr operator--(int) noexcept { offset_ptr tmp(*this); --(*this); return tmp; }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator+=(difference_type n) noexcept {
+        pointer p = get();
+        p += n;
+        *this = offset_ptr(p);
+        return *this;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr& operator-=(difference_type n) noexcept {
+        pointer p = get();
+        p -= n;
+        *this = offset_ptr(p);
+        return *this;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE offset_ptr operator+(difference_type n) const noexcept {
+        offset_ptr tmp(*this);
+        tmp += n;
+        return tmp;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE offset_ptr operator-(difference_type n) const noexcept {
+        offset_ptr tmp(*this);
+        tmp -= n;
+        return tmp;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE difference_type operator-(const offset_ptr& other) const noexcept {
+        return get() - other.get();
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] SHM_FORCE_INLINE U& operator[](difference_type i) const noexcept {
+        return *(get() + i);
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    static SHM_FORCE_INLINE offset_ptr pointer_to(U& r) noexcept {
+        return offset_ptr(&r);
+    }
+
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator<(const offset_ptr& a, const offset_ptr& b) noexcept { return a.get() < b.get(); }
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator>(const offset_ptr& a, const offset_ptr& b) noexcept { return b < a; }
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator<=(const offset_ptr& a, const offset_ptr& b) noexcept { return !(b < a); }
+    [[nodiscard]] friend SHM_FORCE_INLINE bool operator>=(const offset_ptr& a, const offset_ptr& b) noexcept { return !(a < b); }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    [[nodiscard]] friend SHM_FORCE_INLINE offset_ptr operator+(difference_type n, offset_ptr p) noexcept {
+        p += n;
+        return p;
+    }
+
 private:
     SHM_FORCE_INLINE void set(pointer p) noexcept {
         if (!p) { off_plus1_ = 0; return; }
@@ -398,6 +675,7 @@ private:
 
     offset_type off_plus1_ = 0;
 };
+
 
 template <class T, class Tag, detail::offset_int OffsetT = std::uint32_t>
 using segment_offset_ptr = offset_ptr<T, segment_anchor<Tag>, OffsetT>;
@@ -571,56 +849,66 @@ public:
         return x >= arena_addr_ && x < (arena_addr_ + static_cast<std::uintptr_t>(capacity_));
     }
 
-    
-    template <class T>
+       template <class T>
     struct stl_allocator {
-        using value_type = T;
+    using value_type      = T;
+    using size_type       = std::size_t;
+    using difference_type = std::ptrdiff_t;
 
-        linear_allocator* arena = nullptr;
+    using pointer            = handle<T>;
+    using const_pointer      = handle<const T>;
+    using void_pointer       = void_handle;
+    using const_void_pointer = handle<const void>;
 
-        stl_allocator() noexcept = default;
-        explicit stl_allocator(linear_allocator& a) noexcept : arena(&a) {}
+    handle<linear_allocator> arena = handle<linear_allocator>(nullptr);
 
-        template <class U>
-        stl_allocator(const stl_allocator<U>& other) noexcept : arena(other.arena) {}
+    stl_allocator() noexcept = default;
+    explicit stl_allocator(linear_allocator& a) noexcept : arena(&a) {}
 
-        [[nodiscard]] T* allocate(std::size_t n) {
-            if (!arena) throw std::bad_alloc();
-            if (n > (std::numeric_limits<std::size_t>::max() / sizeof(T))) throw std::bad_alloc();
-            void* p = arena->alloc(sizeof(T) * n, alignof(T));
-            if (!p) throw std::bad_alloc();
-            return static_cast<T*>(p);
-        }
+    template <class U>
+    stl_allocator(const stl_allocator<U>& other) noexcept : arena(other.arena) {}
 
-        void deallocate(T*, std::size_t) noexcept {
-        }
+    [[nodiscard]] pointer allocate(size_type n) {
+        if (n == 0) return pointer(nullptr);
+        if (!arena) throw std::bad_alloc();
+        if (n > (std::numeric_limits<size_type>::max)() / sizeof(T)) throw std::bad_alloc();
 
-        template <class U>
-        struct rebind { using other = stl_allocator<U>; };
+        linear_allocator* a = arena.get();
+        void* p = a->alloc(sizeof(T) * n, alignof(T));
+        if (!p) throw std::bad_alloc();
+        return pointer(static_cast<T*>(p));
+    }
 
-        using propagate_on_container_copy_assignment = std::true_type;
-        using propagate_on_container_move_assignment = std::true_type;
-        using propagate_on_container_swap            = std::true_type;
-        using is_always_equal                        = std::false_type;
+    void deallocate(pointer, size_type) noexcept {}
 
-        template <class U>
-        friend bool operator==(const stl_allocator& a, const stl_allocator<U>& b) noexcept {
-            return a.arena == b.arena;
-        }
-        template <class U>
-        friend bool operator!=(const stl_allocator& a, const stl_allocator<U>& b) noexcept {
-            return !(a == b);
-        }
-    };
+    template <class U>
+    struct rebind { using other = stl_allocator<U>; };
 
-private:
-    std::byte* const arena_;
-    std::uintptr_t const arena_addr_;
-    std::size_t const capacity_;
-    std::atomic<std::size_t> cursor_;
+    using propagate_on_container_copy_assignment = std::true_type;
+    using propagate_on_container_move_assignment = std::true_type;
+    using propagate_on_container_swap            = std::true_type;
+    using is_always_equal                        = std::false_type;
+
+    template <class U>
+    friend struct stl_allocator;
+
+    template <class U>
+    friend bool operator==(const stl_allocator& a, const stl_allocator<U>& b) noexcept {
+        return a.arena == b.arena;
+    }
+    template <class U>
+    friend bool operator!=(const stl_allocator& a, const stl_allocator<U>& b) noexcept {
+        return !(a == b);
+    }
 };
 
+private:
+    std::byte* arena_ = nullptr;
+    std::uintptr_t arena_addr_ = 0;
+    std::size_t capacity_ = 0;
+    std::atomic<std::size_t> cursor_{0};
 
+};
 
 namespace detail::seg {
 
@@ -633,7 +921,7 @@ static inline std::string normalize_name_(const char* name) {
     return s;
 }
 
-#if !defined(_WIN32)
+#if !SHM_PLATFORM_WIN32
 
 template <class Fn, class... Args>
 static inline auto retry_eintr_call_(Fn fn, Args... args) noexcept -> decltype(fn(args...)) {
@@ -645,10 +933,18 @@ static inline auto retry_eintr_call_(Fn fn, Args... args) noexcept -> decltype(f
 }
 
 static inline std::size_t page_size_() noexcept {
+#if SHM_PLATFORM_WIN32
+    SYSTEM_INFO si{};
+    ::GetSystemInfo(&si);
+    std::size_t ps = static_cast<std::size_t>(si.dwPageSize);
+    return ps ? ps : 4096u;
+#else
     long ps = ::sysconf(_SC_PAGESIZE);
-    if (ps <= 0) return 4096;
+    if (ps <= 0) ps = 4096;
     return static_cast<std::size_t>(ps);
+#endif
 }
+
 
 static inline std::size_t round_up_(std::size_t x, std::size_t a) noexcept {
     if (a == 0) return x;
@@ -685,7 +981,7 @@ static inline void nanosleep_backoff_(std::size_t attempt) noexcept {
 
 #endif
 
-#if defined(_WIN32)
+#if SHM_PLATFORM_WIN32
     [[nodiscard]] SHM_FORCE_INLINE DWORD last_error() noexcept {
         return ::GetLastError();
     }
@@ -742,7 +1038,6 @@ static inline void nanosleep_backoff_(std::size_t attempt) noexcept {
                               ERROR_INVALID_NAME);
         }
 
-        // Drop the leading '/', keep body as UTF-8.
         std::wstring wbody = utf8_to_wstring_strict(
             std::string_view(portable_name.data() + 1, portable_name.size() - 1)
         );
@@ -954,7 +1249,7 @@ public:
     enum class open_mode { create_only, open_only, open_or_create };
 
     segment(const char* name, std::size_t size, open_mode mode)
-#if defined(_WIN32)
+#if SHM_PLATFORM_WIN32
         : hMapFile_(NULL)
         , base_(nullptr)
         , size_(0)
@@ -975,8 +1270,7 @@ public:
             throw std::invalid_argument("shm::segment: name must not be null/empty");
         }
 
-#if defined(_WIN32)
-        // -------------------- WIN32 --------------------
+#if SHM_PLATFORM_WIN32
         const bool may_create = (mode == open_mode::create_only || mode == open_mode::open_or_create);
         if (may_create && size == 0) {
             throw std::invalid_argument("shm::segment: size must be > 0 for create modes");
@@ -1245,7 +1539,7 @@ public:
     }
 
     ~segment() noexcept {
-#if defined(_WIN32)
+#if SHM_PLATFORM_WIN32
         if (base_ != nullptr) {
             ::UnmapViewOfFile(base_);
             base_ = nullptr;
@@ -1282,7 +1576,7 @@ public:
     std::size_t size() const noexcept { return size_; }
 
     bool is_valid() const noexcept {
-#if defined(_WIN32)
+#if SHM_PLATFORM_WIN32
         return valid_ && base_ != nullptr && size_ != 0;
 #else
         return fd_ != -1 && base_ != nullptr && size_ != 0;
@@ -1290,9 +1584,8 @@ public:
     }
 
     static bool remove(const char* name) noexcept {
-#if defined(_WIN32)
+#if SHM_PLATFORM_WIN32
         (void)name;
-        // Named sections die when last handle closes.
         return true;
 #else
         const std::string n = detail::seg::normalize_name_(name);
@@ -1311,7 +1604,7 @@ public:
     }
 
 private:
-#if defined(_WIN32)
+#if SHM_PLATFORM_WIN32
     HANDLE hMapFile_ = NULL;
     void*  base_     = nullptr;
     std::size_t size_     = 0;   
