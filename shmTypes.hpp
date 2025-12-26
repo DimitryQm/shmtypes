@@ -8,6 +8,10 @@
 #include <new>
 #include <utility>
 #include <cstring>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <stdexcept>
 
 #if defined(_MSC_VER)
   #define SHM_FORCE_INLINE __forceinline
@@ -568,27 +572,10 @@ private:
 };
 
 
-#include "shmTypes.hpp"
-
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <utility>
-
-#if !defined(_WIN32)
-#include <cerrno>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <time.h>
-#include <unistd.h>
-#endif
 
 
-namespace detail {
+
+namespace detail::seg {
 
 #if !defined(_WIN32)
 
@@ -649,7 +636,8 @@ static inline void nanosleep_backoff_(std::size_t attempt) noexcept {
 
 #endif
 
-} // namespace detail
+} // namespace detail::seg
+
 
 class segment {
 public:
@@ -673,7 +661,7 @@ public:
         , size_(0)
         , map_size_(0)
         , created_(false)
-        , name_(detail::normalize_name_(name))
+        , name_(detail::seg::normalize_name_(name))
 #endif
     {
 #if defined(_WIN32)
@@ -685,7 +673,7 @@ public:
         if (name_.empty()) {
             throw std::invalid_argument("shm::segment: name must not be null/empty");
         }
-        if (!detail::name_is_portable_(name_)) {
+        if (!detail::seg::name_is_portable_(name_)) {
             throw std::invalid_argument("shm::segment: name must be portable POSIX shm form '/X' with no additional '/'");
         }
 
@@ -694,7 +682,7 @@ public:
             throw std::invalid_argument("shm::segment: size must be > 0 for create modes");
         }
 
-        const std::size_t ps = detail::page_size_();
+        const std::size_t ps = detail::seg::page_size_();
 
         const int perms = 0600;
 
@@ -722,7 +710,7 @@ public:
 
         auto close_noexcept = [&](int& fd) noexcept {
             if (fd != -1) {
-                (void)detail::retry_eintr_call_(::close, fd);
+                (void)detail::seg::retry_eintr_call_(::close, fd);
                 fd = -1;
             }
         };
@@ -791,7 +779,7 @@ public:
                     ok = true;
                     break;
                 }
-                detail::nanosleep_backoff_(attempt);
+                detail::seg::nanosleep_backoff_(attempt);
             }
 
             if (!ok) {
@@ -810,7 +798,7 @@ public:
         }
 
         size_ = seg_size;
-        map_size_ = detail::round_up_(seg_size, ps);
+        map_size_ = detail::seg::round_up_(seg_size, ps);
 
         void* map = ::mmap(nullptr,
                            map_size_,
@@ -854,7 +842,7 @@ public:
             base_ = nullptr;
         }
         if (fd_ != -1) {
-            (void)detail::retry_eintr_call_(::close, fd_);
+            (void)detail::seg::retry_eintr_call_(::close, fd_);
             fd_ = -1;
         }
         size_ = 0;
@@ -884,9 +872,9 @@ public:
         (void)name;
         return false;
 #else
-        const std::string n = detail::normalize_name_(name);
+        const std::string n = detail::seg::normalize_name_(name);
         if (n.empty()) return false;
-        if (!detail::name_is_portable_(n)) return false;
+        if (!detail::seg::name_is_portable_(n)) return false;
 
         if (::shm_unlink(n.c_str()) == 0) return true;
         if (errno == ENOENT) return true;
