@@ -155,10 +155,6 @@ int main() {
 
     // Rebind segment base in the "other process" view.
     shm::segment_base<MyTag>::set(consumer_base);
-
-    // Locate the allocator header.
-    auto* consumer_arena = reinterpret_cast<ShmAllocator*>(consumer_base);
-
     // Locate the persisted vector handle at the fixed offset.
     void* vec_ptr_location = static_cast<void*>(static_cast<std::byte*>(consumer_base) + sizeof(ShmAllocator));
     auto* consumer_vec_handle =
