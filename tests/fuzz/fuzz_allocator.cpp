@@ -12,12 +12,13 @@
 #include <utility>
 #include <vector>
 
-#if !defined(_WIN32)
-  #include <unistd.h>
-  #include errno.h
-    #else
-
+#if defined(_WIN32)
+  #define NOMINMAX
   #include <windows.h>
+  #include <malloc.h>
+#else
+  #include <unistd.h>
+  #include <errno.h>
 #endif
 
 namespace {
@@ -109,17 +110,54 @@ struct Node {
 static_assert(std::is_standard_layout_v<Node>);
 static_assert(std::is_trivially_copyable_v<Node> == false || true, "Node may be non-trivial; construction is via make_handle.");
 
+
+static inline std::size_t os_pagesize() noexcept {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    ::GetSystemInfo(&si);
+    const std::size_t p = static_cast<std::size_t>(si.dwPageSize);
+    return (p != 0) ? p : 4096;
+#else
+    const long p = ::sysconf(_SC_PAGESIZE);
+    return (p > 0) ? static_cast<std::size_t>(p) : 4096;
+#endif
+}
+
+static inline void* os_aligned_alloc(std::size_t alignment, std::size_t size) noexcept {
+    if (alignment == 0) alignment = 1;
+
+#if defined(_WIN32)
+    if ((alignment & (alignment - 1)) != 0) return nullptr;
+    if (alignment < sizeof(void*)) alignment = sizeof(void*);
+    return ::_aligned_malloc(size, alignment);
+#else
+    void* p = nullptr;
+    const int rc = ::posix_memalign(&p, alignment, size);
+    return (rc == 0) ? p : nullptr;
+#endif
+}
+
+static inline void os_aligned_free(void* p) noexcept {
+#if defined(_WIN32)
+    ::_aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+
+
 static int fuzz_one(const std::uint8_t* data, std::size_t size) {
     using Alloc = shm::linear_allocator<FuzzTag, std::uint32_t>;
     constexpr std::size_t kArenaSize = 1ull * 1024ull * 1024ull;
 
-    std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    std::size_t page = os_pagesize();
     if (page == 0 || (page & (page - 1)) != 0) page = 4096;
+    
+    void* pa = os_aligned_alloc(page, kArenaSize);
+    void* pb = os_aligned_alloc(page, kArenaSize);
+    CHECK(pa != nullptr);
+    CHECK(pb != nullptr);
 
-    void* pa = nullptr;
-    void* pb = nullptr;
-    CHECK(::posix_memalign(&pa, page, kArenaSize) == 0);
-    CHECK(::posix_memalign(&pb, page, kArenaSize) == 0);
 
     std::byte* arena_a = static_cast<std::byte*>(pa);
     std::byte* arena_b = static_cast<std::byte*>(pb);
@@ -295,8 +333,9 @@ static int fuzz_one(const std::uint8_t* data, std::size_t size) {
     CHECK(alloc.used() == model_cursor);
     verify_no_overlap_and_within(blocks, kArenaSize, base_live);
 
-    std::free(arena_a);
-    std::free(arena_b);    
+    os_aligned_free(arena_a);
+    os_aligned_free(arena_b);
+
     return 0;
 }
 
