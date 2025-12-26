@@ -37,6 +37,16 @@
   #define SHM_UNLIKELY(x) (x)
 #endif
 
+#if !defined(_WIN32)
+  #include <cerrno>
+  #include <fcntl.h>
+  #include <sys/mman.h>
+  #include <sys/stat.h>
+  #include <sys/types.h>
+  #include <time.h>
+  #include <unistd.h>
+#endif
+
 #ifndef SHM_OFFSET_PTR_DEBUG
   #define SHM_OFFSET_PTR_DEBUG 0
 #endif
