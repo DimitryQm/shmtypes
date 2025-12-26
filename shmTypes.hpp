@@ -1328,3 +1328,4 @@ private:
     std::string name_;
 #endif
 };
+}
