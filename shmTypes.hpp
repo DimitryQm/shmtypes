@@ -568,6 +568,373 @@ private:
 };
 
 
+#include "shmTypes.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
+
+#if !defined(_WIN32)
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#endif
+
+
+namespace detail {
+
+#if !defined(_WIN32)
+
+template <class Fn, class... Args>
+static inline auto retry_eintr_call_(Fn fn, Args... args) noexcept -> decltype(fn(args...)) {
+    for (;;) {
+        auto rc = fn(args...);
+        if (rc == decltype(rc)(-1) && errno == EINTR) continue;
+        return rc;
+    }
+}
+
+static inline std::size_t page_size_() noexcept {
+    long ps = ::sysconf(_SC_PAGESIZE);
+    if (ps <= 0) return 4096;
+    return static_cast<std::size_t>(ps);
+}
+
+static inline std::size_t round_up_(std::size_t x, std::size_t a) noexcept {
+    if (a == 0) return x;
+    const std::size_t r = x % a;
+    return r == 0 ? x : (x + (a - r));
+}
+
+// POSIX shm name rules in practice must start with '/', must not contain any other '/'.
+// SInce platforms are more permissive, we enforce the strict portable subset.
+static inline bool name_is_portable_(std::string_view s) noexcept {
+    if (s.empty()) return false;
+    if (s[0] != '/') return false;
+    if (s.size() == 1) return false;
+    for (std::size_t i = 1; i < s.size(); ++i) {
+        const char c = s[i];
+        if (c == '/') return false;
+        if (c == '\0') return false;
+    }
+    return true;
+}
+
+static inline std::string normalize_name_(const char* name) {
+    if (!name || !*name) return {};
+    std::string s(name);
+    if (s[0] != '/') s.insert(s.begin(), '/');
+    while (s.size() > 1 && s.back() == '/') s.pop_back();
+    return s;
+}
+
+static inline void nanosleep_backoff_(std::size_t attempt) noexcept {
+    // attempt=0.. => 100us, 200us, 400us ... capped at 10ms
+    const std::size_t max_ns = 10ull * 1000ull * 1000ull;
+    std::size_t ns = 100ull * 1000ull;
+    if (attempt < 10) ns <<= attempt;
+    if (ns > max_ns) ns = max_ns;
+    timespec ts{};
+    ts.tv_sec = 0;
+    ts.tv_nsec = static_cast<long>(ns);
+    ::nanosleep(&ts, nullptr);
+}
+
+#endif
+
+} // namespace detail
+
+class segment {
+public:
+    enum class open_mode {
+        create_only,
+        open_only,
+        open_or_create
+    };
+
+    segment(const char* name, std::size_t size, open_mode mode)
+#if defined(_WIN32)
+        : base_(nullptr)
+        , size_(0)
+        , map_size_(0)
+        , valid_(false)
+        , created_(false)
+        , name_()
+#else
+        : fd_(-1)
+        , base_(nullptr)
+        , size_(0)
+        , map_size_(0)
+        , created_(false)
+        , name_(detail::normalize_name_(name))
+#endif
+    {
+#if defined(_WIN32)
+        (void)name;
+        (void)size;
+        (void)mode;
+        valid_ = false;
+#else
+        if (name_.empty()) {
+            throw std::invalid_argument("shm::segment: name must not be null/empty");
+        }
+        if (!detail::name_is_portable_(name_)) {
+            throw std::invalid_argument("shm::segment: name must be portable POSIX shm form '/X' with no additional '/'");
+        }
+
+        const bool may_create = (mode == open_mode::create_only || mode == open_mode::open_or_create);
+        if (may_create && size == 0) {
+            throw std::invalid_argument("shm::segment: size must be > 0 for create modes");
+        }
+
+        const std::size_t ps = detail::page_size_();
+
+        const int perms = 0600;
+
+        int flags = O_RDWR;
+#if defined(O_CLOEXEC)
+        flags |= O_CLOEXEC;
+#endif
+
+        auto throw_errno = [&](const char* op) -> void {
+            const int e = errno;
+            std::error_code ec(e, std::generic_category());
+            std::string msg;
+            msg.reserve(256);
+            msg.append("shm::segment: ");
+            msg.append(op);
+            msg.append(" failed (name=");
+            msg.append(name_);
+            msg.append(", errno=");
+            msg.append(std::to_string(e));
+            msg.append(", ");
+            msg.append(ec.message());
+            msg.append(")");
+            throw std::system_error(ec, msg);
+        };
+
+        auto close_noexcept = [&](int& fd) noexcept {
+            if (fd != -1) {
+                (void)detail::retry_eintr_call_(::close, fd);
+                fd = -1;
+            }
+        };
+
+        auto unlink_noexcept = [&]() noexcept {
+            if (!name_.empty()) {
+                (void)::shm_unlink(name_.c_str());
+            }
+        };
+
+        auto fail_ctor = [&](bool unlink_if_created) -> void {
+            if (base_) {
+                ::munmap(base_, map_size_);
+                base_ = nullptr;
+                size_ = 0;
+                map_size_ = 0;
+            }
+            close_noexcept(fd_);
+            if (unlink_if_created) unlink_noexcept();
+        };
+
+        int fd = -1;
+        if (mode == open_mode::create_only) {
+            fd = ::shm_open(name_.c_str(), flags | O_CREAT | O_EXCL, perms);
+            if (fd == -1) throw_errno("shm_open(create_only)");
+            created_ = true;
+        } else if (mode == open_mode::open_only) {
+            fd = ::shm_open(name_.c_str(), flags, perms);
+            if (fd == -1) throw_errno("shm_open(open_only)");
+            created_ = false;
+        } else {
+            fd = ::shm_open(name_.c_str(), flags | O_CREAT | O_EXCL, perms);
+            if (fd == -1) {
+                if (errno != EEXIST) throw_errno("shm_open(open_or_create/create)");
+                fd = ::shm_open(name_.c_str(), flags, perms);
+                if (fd == -1) throw_errno("shm_open(open_or_create/open)");
+                created_ = false;
+            } else {
+                created_ = true;
+            }
+        }
+
+        fd_ = fd;
+
+        std::size_t seg_size = 0;
+        if (created_) {
+            if (::ftruncate(fd_, static_cast<off_t>(size)) != 0) {
+                const int saved = errno;
+                fail_ctor(true);
+                errno = saved;
+                throw_errno("ftruncate(create)");
+            }
+            seg_size = size;
+        } else {
+            struct stat st {};
+            bool ok = false;
+
+            for (std::size_t attempt = 0; attempt < 200; ++attempt) {
+                if (::fstat(fd_, &st) != 0) {
+                    const int saved = errno;
+                    fail_ctor(false);
+                    errno = saved;
+                    throw_errno("fstat(open)");
+                }
+                if (st.st_size > 0) {
+                    ok = true;
+                    break;
+                }
+                detail::nanosleep_backoff_(attempt);
+            }
+
+            if (!ok) {
+                fail_ctor(false);
+                throw std::runtime_error("shm::segment: existing segment reports size 0 after retries");
+            }
+
+            const std::size_t existing = static_cast<std::size_t>(st.st_size);
+
+            if (size != 0 && existing < size) {
+                fail_ctor(false);
+                throw std::runtime_error("shm::segment: existing segment smaller than requested size");
+            }
+
+            seg_size = existing;
+        }
+
+        size_ = seg_size;
+        map_size_ = detail::round_up_(seg_size, ps);
+
+        void* map = ::mmap(nullptr,
+                           map_size_,
+                           PROT_READ | PROT_WRITE,
+                           MAP_SHARED,
+                           fd_,
+                           0);
+
+        if (map == MAP_FAILED) {
+            const int saved = errno;
+            fail_ctor(created_);
+            errno = saved;
+            throw_errno("mmap");
+        }
+
+        base_ = map;
+
+#if defined(MADV_DONTDUMP)
+        (void)::madvise(base_, map_size_, MADV_DONTDUMP);
+#endif
+#if defined(MADV_HUGEPAGE)
+        (void)::madvise(base_, map_size_, MADV_HUGEPAGE);
+#endif
+
+        if (created_) {
+            std::memset(base_, 0, size_);
+        }
+#endif
+    }
+
+    ~segment() noexcept {
+#if defined(_WIN32)
+        base_ = nullptr;
+        size_ = 0;
+        map_size_ = 0;
+        valid_ = false;
+        created_ = false;
+#else
+        if (base_) {
+            ::munmap(base_, map_size_);
+            base_ = nullptr;
+        }
+        if (fd_ != -1) {
+            (void)detail::retry_eintr_call_(::close, fd_);
+            fd_ = -1;
+        }
+        size_ = 0;
+        map_size_ = 0;
+        created_ = false;
+#endif
+    }
+
+    segment(const segment&) = delete;
+    segment& operator=(const segment&) = delete;
+    segment(segment&&) = delete;
+    segment& operator=(segment&&) = delete;
+
+    void* base() const noexcept { return base_; }
+    std::size_t size() const noexcept { return size_; }
+
+    bool is_valid() const noexcept {
+#if defined(_WIN32)
+        return valid_;
+#else
+        return fd_ != -1 && base_ != nullptr && size_ != 0;
+#endif
+    }
+
+    static bool remove(const char* name) noexcept {
+#if defined(_WIN32)
+        (void)name;
+        return false;
+#else
+        const std::string n = detail::normalize_name_(name);
+        if (n.empty()) return false;
+        if (!detail::name_is_portable_(n)) return false;
+
+        if (::shm_unlink(n.c_str()) == 0) return true;
+        if (errno == ENOENT) return true;
+        return false;
+#endif
+    }
+
+    template <class Tag>
+    void bind() const noexcept {
+        if (base_) {
+            shm::segment_base<Tag>::set(base_);
+        }
+    }
+
+    template <class Tag, detail::offset_int OffsetT = std::uint32_t>
+    [[nodiscard]] shm::linear_allocator<Tag, OffsetT> make_allocator(std::size_t arena_offset = 0,
+                                                                     std::size_t arena_size = 0) const noexcept
+    {
+        if (!base_ || size_ == 0 || arena_offset > size_) {
+            return shm::linear_allocator<Tag, OffsetT>(nullptr, nullptr, 0);
+        }
+
+        std::byte* seg_base = reinterpret_cast<std::byte*>(base_);
+        std::byte* arena = seg_base + arena_offset;
+
+        std::size_t avail = size_ - arena_offset;
+        if (arena_size != 0 && arena_size < avail) avail = arena_size;
+
+        return shm::linear_allocator<Tag, OffsetT>(seg_base, arena, avail);
+    }
+
+private:
+#if defined(_WIN32)
+    void* base_;
+    std::size_t size_;
+    std::size_t map_size_;
+    bool valid_;
+    bool created_;
+    std::string name_;
+#else
+    int fd_;
+    void* base_;
+    std::size_t size_;
+    std::size_t map_size_;
+    bool created_;
+    std::string name_;
+#endif
+};
 
 
 } // namespace shm
