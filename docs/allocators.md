@@ -1,4 +1,3 @@
-````markdown
 # Allocators: `linear_allocator` Arena Allocation Inside a Segment
 
 This library provides `linear_allocator<Tag, OffsetT>`, a linear arena allocator intended for allocating storage from a contiguous byte range that is itself part of a position-independent segment. The allocator is monotonic. Successful allocations advance a cursor forward and never move it backward. There is no per-allocation free. Reclamation is an explicit arena-wide operation performed by `reset()`.
