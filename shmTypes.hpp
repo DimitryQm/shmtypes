@@ -624,6 +624,15 @@ private:
 
 namespace detail::seg {
 
+
+static inline std::string normalize_name_(const char* name) {
+    if (!name || !*name) return {};
+    std::string s(name);
+    if (s[0] != '/') s.insert(s.begin(), '/');
+    while (s.size() > 1 && s.back() == '/') s.pop_back();
+    return s;
+}
+
 #if !defined(_WIN32)
 
 template <class Fn, class... Args>
@@ -661,13 +670,6 @@ static inline bool name_is_portable_(std::string_view s) noexcept {
     return true;
 }
 
-static inline std::string normalize_name_(const char* name) {
-    if (!name || !*name) return {};
-    std::string s(name);
-    if (s[0] != '/') s.insert(s.begin(), '/');
-    while (s.size() > 1 && s.back() == '/') s.pop_back();
-    return s;
-}
 
 static inline void nanosleep_backoff_(std::size_t attempt) noexcept {
     // attempt=0.. => 100us, 200us, 400us ... capped at 10ms
@@ -684,12 +686,6 @@ static inline void nanosleep_backoff_(std::size_t attempt) noexcept {
 #endif
 
 #if defined(_WIN32)
-#if defined(_MSC_VER)
-      #define SHM_FORCE_INLINE __forceinline
-    #else
-      #define SHM_FORCE_INLINE inline __attribute__((always_inline))
-    #endif
-
     [[nodiscard]] SHM_FORCE_INLINE DWORD last_error() noexcept {
         return ::GetLastError();
     }
@@ -955,22 +951,17 @@ static inline void nanosleep_backoff_(std::size_t attempt) noexcept {
 
 class segment {
 public:
-    enum class open_mode {
-        create_only,
-        open_only,
-        open_or_create
-    };
+    enum class open_mode { create_only, open_only, open_or_create };
 
     segment(const char* name, std::size_t size, open_mode mode)
 #if defined(_WIN32)
-    : hMapFile_(NULL)
-    , base_(nullptr)
-    , size_(0)
-    , map_size_(0)
-    , valid_(false)
-    , created_(false)
-    , name_(detail::seg::normalize_name_(name))
-
+        : hMapFile_(NULL)
+        , base_(nullptr)
+        , size_(0)
+        , map_size_(0)
+        , valid_(false)
+        , created_(false)
+        , name_(detail::seg::normalize_name_(name))
 #else
         : fd_(-1)
         , base_(nullptr)
@@ -980,15 +971,139 @@ public:
         , name_(detail::seg::normalize_name_(name))
 #endif
     {
-#if defined(_WIN32)
-        (void)name;
-        (void)size;
-        (void)mode;
-        valid_ = false;
-#else
         if (name_.empty()) {
             throw std::invalid_argument("shm::segment: name must not be null/empty");
         }
+
+#if defined(_WIN32)
+        // -------------------- WIN32 --------------------
+        const bool may_create = (mode == open_mode::create_only || mode == open_mode::open_or_create);
+        if (may_create && size == 0) {
+            throw std::invalid_argument("shm::segment: size must be > 0 for create modes");
+        }
+
+        const std::wstring wname = detail::seg::win32_object_name_from_portable(name_);
+
+        constexpr DWORD kMapAccess   = SHM_WIN32_MAP_ACCESS;
+        constexpr DWORD kPageProtect = PAGE_READWRITE;
+
+        auto harden_handle_noninherit = [](HANDLE h) noexcept {
+            if (h != NULL) (void)::SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+        };
+
+        detail::seg::unique_handle h;
+        detail::seg::unique_view   v;
+
+        bool created_local = false;
+        std::size_t exposed_size = 0;
+
+        const auto& si = detail::seg::sysinfo();
+        const std::size_t create_max =
+            may_create ? detail::seg::round_up(size, static_cast<std::size_t>(si.page_size)) : 0;
+
+        SECURITY_ATTRIBUTES* psa = nullptr;
+#if defined(SHM_WIN32_USE_SDDL_DACL)
+        detail::seg::sddl_security sec;
+#ifndef SHM_WIN32_SDDL_STRING
+# error SHM_WIN32_USE_SDDL_DACL requires SHM_WIN32_SDDL_STRING, e.g. L"D:(A;;GA;;;WD)"
+#endif
+        psa = sec.build_or_throw(SHM_WIN32_SDDL_STRING, name_);
+#endif
+
+        if (mode == open_mode::open_only) {
+            HANDLE hm = ::OpenFileMappingW(kMapAccess, FALSE, wname.c_str());
+            if (hm == NULL) {
+                throw detail::seg::win32_error("OpenFileMappingW(open_only)", name_, detail::seg::last_error());
+            }
+            harden_handle_noninherit(hm);
+            h.reset(hm);
+            created_local = false;
+        } else {
+            ULARGE_INTEGER win_size{};
+            win_size.QuadPart = static_cast<unsigned long long>(create_max);
+
+            ::SetLastError(0);
+            HANDLE hm = ::CreateFileMappingW(INVALID_HANDLE_VALUE,
+                                             psa,
+                                             kPageProtect,
+                                             win_size.HighPart,
+                                             win_size.LowPart,
+                                             wname.c_str());
+            if (hm == NULL) {
+                throw detail::seg::win32_error("CreateFileMappingW", name_, detail::seg::last_error());
+            }
+            harden_handle_noninherit(hm);
+            h.reset(hm);
+
+            const DWORD last = ::GetLastError();
+            if (last == ERROR_ALREADY_EXISTS) {
+                created_local = false;
+                if (mode == open_mode::create_only) {
+                    throw detail::seg::win32_error("CreateFileMappingW(create_only exists)", name_, last);
+                }
+            } else {
+                created_local = true;
+            }
+        }
+
+        void* view = ::MapViewOfFile(h.get(), kMapAccess, 0, 0, 0);
+        if (!view) {
+            throw detail::seg::win32_error("MapViewOfFile", name_, detail::seg::last_error());
+        }
+        v.reset(view);
+
+        std::uint64_t max_bytes = detail::seg::query_section_max_size_bytes(h.get());
+        if (max_bytes == 0) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(v.get(), &mbi, sizeof(mbi)) == 0) {
+                throw detail::seg::win32_error("VirtualQuery", name_, detail::seg::last_error());
+            }
+            max_bytes = static_cast<std::uint64_t>(mbi.RegionSize);
+        }
+        if (max_bytes == 0) {
+            throw detail::seg::win32_error("query mapping size (0)", name_, ERROR_INVALID_PARAMETER);
+        }
+
+        if (!created_local) {
+            if (size != 0 && max_bytes < static_cast<std::uint64_t>(size)) {
+                throw detail::seg::win32_error("segment(open existing smaller than requested)",
+                                               name_, ERROR_INSUFFICIENT_BUFFER);
+            }
+            exposed_size = (size == 0) ? static_cast<std::size_t>(max_bytes) : size;
+        } else {
+            if (static_cast<std::uint64_t>(size) > max_bytes) {
+                throw detail::seg::win32_error("segment(created smaller than requested)",
+                                               name_, ERROR_INSUFFICIENT_BUFFER);
+            }
+            exposed_size = size;
+        }
+
+        if (!created_local) {
+            constexpr std::size_t want = static_cast<std::size_t>(SHM_WIN32_PREFETCH_BYTES_ON_OPEN);
+            if constexpr (want != 0) {
+                const std::size_t n = (want < exposed_size) ? want : exposed_size;
+                detail::seg::prefetch_best_effort(v.get(), n);
+            }
+        }
+
+#if SHM_WIN32_TRY_VIRTUAL_LOCK
+        (void)::VirtualLock(v.get(), exposed_size);
+#endif
+
+#if SHM_WIN32_ZERO_ON_CREATE
+        if (created_local && exposed_size != 0) {
+            std::memset(v.get(), 0, exposed_size);
+        }
+#endif
+
+        hMapFile_ = h.release();
+        base_     = v.release();
+        size_     = exposed_size;
+        map_size_ = static_cast<std::size_t>(max_bytes);
+        created_  = created_local;
+        valid_    = (base_ != nullptr && hMapFile_ != NULL && size_ != 0);
+
+#else
         if (!detail::seg::name_is_portable_(name_)) {
             throw std::invalid_argument("shm::segment: name must be portable POSIX shm form '/X' with no additional '/'");
         }
@@ -999,7 +1114,6 @@ public:
         }
 
         const std::size_t ps = detail::seg::page_size_();
-
         const int perms = 0600;
 
         int flags = O_RDWR;
@@ -1032,9 +1146,7 @@ public:
         };
 
         auto unlink_noexcept = [&]() noexcept {
-            if (!name_.empty()) {
-                (void)::shm_unlink(name_.c_str());
-            }
+            if (!name_.empty()) (void)::shm_unlink(name_.c_str());
         };
 
         auto fail_ctor = [&](bool unlink_if_created) -> void {
@@ -1081,7 +1193,7 @@ public:
             }
             seg_size = size;
         } else {
-            struct stat st {};
+            struct stat st{};
             bool ok = false;
 
             for (std::size_t attempt = 0; attempt < 200; ++attempt) {
@@ -1091,10 +1203,7 @@ public:
                     errno = saved;
                     throw_errno("fstat(open)");
                 }
-                if (st.st_size > 0) {
-                    ok = true;
-                    break;
-                }
+                if (st.st_size > 0) { ok = true; break; }
                 detail::seg::nanosleep_backoff_(attempt);
             }
 
@@ -1104,25 +1213,17 @@ public:
             }
 
             const std::size_t existing = static_cast<std::size_t>(st.st_size);
-
             if (size != 0 && existing < size) {
                 fail_ctor(false);
                 throw std::runtime_error("shm::segment: existing segment smaller than requested size");
             }
-
             seg_size = existing;
         }
 
         size_ = seg_size;
         map_size_ = detail::seg::round_up_(seg_size, ps);
 
-        void* map = ::mmap(nullptr,
-                           map_size_,
-                           PROT_READ | PROT_WRITE,
-                           MAP_SHARED,
-                           fd_,
-                           0);
-
+        void* map = ::mmap(nullptr, map_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
         if (map == MAP_FAILED) {
             const int saved = errno;
             fail_ctor(created_);
@@ -1139,15 +1240,20 @@ public:
         (void)::madvise(base_, map_size_, MADV_HUGEPAGE);
 #endif
 
-        if (created_) {
-            std::memset(base_, 0, size_);
-        }
+        if (created_) std::memset(base_, 0, size_);
 #endif
     }
 
     ~segment() noexcept {
 #if defined(_WIN32)
-        base_ = nullptr;
+        if (base_ != nullptr) {
+            ::UnmapViewOfFile(base_);
+            base_ = nullptr;
+        }
+        if (hMapFile_ != NULL) {
+            ::CloseHandle(hMapFile_);
+            hMapFile_ = NULL;
+        }
         size_ = 0;
         map_size_ = 0;
         valid_ = false;
@@ -1177,7 +1283,7 @@ public:
 
     bool is_valid() const noexcept {
 #if defined(_WIN32)
-        return valid_;
+        return valid_ && base_ != nullptr && size_ != 0;
 #else
         return fd_ != -1 && base_ != nullptr && size_ != 0;
 #endif
@@ -1186,7 +1292,8 @@ public:
     static bool remove(const char* name) noexcept {
 #if defined(_WIN32)
         (void)name;
-        return false;
+        // Named sections die when last handle closes.
+        return true;
 #else
         const std::string n = detail::seg::normalize_name_(name);
         if (n.empty()) return false;
@@ -1200,46 +1307,24 @@ public:
 
     template <class Tag>
     void bind() const noexcept {
-        if (base_) {
-            shm::segment_base<Tag>::set(base_);
-        }
-    }
-
-    template <class Tag, detail::offset_int OffsetT = std::uint32_t>
-    [[nodiscard]] shm::linear_allocator<Tag, OffsetT> make_allocator(std::size_t arena_offset = 0,
-                                                                     std::size_t arena_size = 0) const noexcept
-    {
-        if (!base_ || size_ == 0 || arena_offset > size_) {
-            return shm::linear_allocator<Tag, OffsetT>(nullptr, nullptr, 0);
-        }
-
-        std::byte* seg_base = reinterpret_cast<std::byte*>(base_);
-        std::byte* arena = seg_base + arena_offset;
-
-        std::size_t avail = size_ - arena_offset;
-        if (arena_size != 0 && arena_size < avail) avail = arena_size;
-
-        return shm::linear_allocator<Tag, OffsetT>(seg_base, arena, avail);
+        if (base_) shm::segment_base<Tag>::set(base_);
     }
 
 private:
 #if defined(_WIN32)
-
-    std::size_t size_;
-    std::size_t map_size_;
-    bool valid_;
-    bool created_;
+    HANDLE hMapFile_ = NULL;
+    void*  base_     = nullptr;
+    std::size_t size_     = 0;   
+    std::size_t map_size_ = 0;
+    bool valid_   = false;
+    bool created_ = false;
     std::string name_;
 #else
-    HANDLE hMapFile_ = NULL;
-    int fd_;
-    void* base_;
-    std::size_t size_;
-    std::size_t map_size_;
-    bool created_;
+    int   fd_   = -1;
+    void* base_ = nullptr;
+    std::size_t size_     = 0;
+    std::size_t map_size_ = 0;
+    bool created_ = false;
     std::string name_;
 #endif
 };
-
-
-} // namespace shm
