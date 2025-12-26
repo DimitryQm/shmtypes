@@ -530,22 +530,20 @@ public:
 
     constexpr offset_ptr() noexcept = default;
     constexpr offset_ptr(std::nullptr_t) noexcept : off_plus1_(0) {}
-    SHM_FORCE_INLINE explicit offset_ptr(pointer p) noexcept { set(p); }
-    SHM_FORCE_INLINE offset_ptr(const offset_ptr& other) noexcept { set(other.get()); }
-    SHM_FORCE_INLINE offset_ptr& operator=(const offset_ptr& other) noexcept {
-        if (this != &other) set(other.get());
-        return *this;
-    }
 
+    SHM_FORCE_INLINE explicit offset_ptr(pointer p) noexcept { set(p); }
+
+    // IMPORTANT: self_reloc must be trivially copyable for memcpy-relocation.
+    offset_ptr(const offset_ptr&) noexcept = default;
+    offset_ptr& operator=(const offset_ptr&) noexcept = default;
     offset_ptr(offset_ptr&&) noexcept = default;
     offset_ptr& operator=(offset_ptr&&) noexcept = default;
     ~offset_ptr() = default;
 
     template <class U>
     requires (std::is_convertible_v<U*, T*>)
-    SHM_FORCE_INLINE offset_ptr(const offset_ptr<U, self_reloc_anchor, OffsetT>& other) noexcept {
-        set(other.get());
-    }
+    SHM_FORCE_INLINE offset_ptr(const offset_ptr<U, self_reloc_anchor, OffsetT>& other) noexcept
+        : off_plus1_(static_cast<offset_type>(other.raw_storage())) {}
 
     SHM_FORCE_INLINE offset_ptr& operator=(pointer p) noexcept { set(p); return *this; }
     SHM_FORCE_INLINE offset_ptr& operator=(std::nullptr_t) noexcept { off_plus1_ = 0; return *this; }
@@ -576,28 +574,53 @@ public:
     requires (!std::is_void_v<U>)
     [[nodiscard]] SHM_FORCE_INLINE U* operator->() const noexcept { return get(); }
 
-    template <class U = T>
-    requires (!std::is_void_v<U>)
-    SHM_FORCE_INLINE offset_ptr& operator++() noexcept { *this += 1; return *this; }
+    // ---- fancy pointer ops (self-reloc specialization) ----
+    // NOTE: Must NOT copy *this* into a temporary, because base(this) changes with address.
 
     template <class U = T>
     requires (!std::is_void_v<U>)
-    SHM_FORCE_INLINE offset_ptr operator++(int) noexcept { offset_ptr tmp(*this); ++(*this); return tmp; }
+    SHM_FORCE_INLINE offset_ptr& operator++() noexcept {
+        pointer p = get();
+        ++p;
+        set(p);
+        return *this;
+    }
 
     template <class U = T>
     requires (!std::is_void_v<U>)
-    SHM_FORCE_INLINE offset_ptr& operator--() noexcept { *this -= 1; return *this; }
+    SHM_FORCE_INLINE offset_ptr operator++(int) noexcept {
+        pointer old = get();
+        pointer p = old;
+        ++p;
+        set(p);
+        return offset_ptr(old); // prvalue: constructed directly in return storage
+    }
 
     template <class U = T>
     requires (!std::is_void_v<U>)
-    SHM_FORCE_INLINE offset_ptr operator--(int) noexcept { offset_ptr tmp(*this); --(*this); return tmp; }
+    SHM_FORCE_INLINE offset_ptr& operator--() noexcept {
+        pointer p = get();
+        --p;
+        set(p);
+        return *this;
+    }
+
+    template <class U = T>
+    requires (!std::is_void_v<U>)
+    SHM_FORCE_INLINE offset_ptr operator--(int) noexcept {
+        pointer old = get();
+        pointer p = old;
+        --p;
+        set(p);
+        return offset_ptr(old);
+    }
 
     template <class U = T>
     requires (!std::is_void_v<U>)
     SHM_FORCE_INLINE offset_ptr& operator+=(difference_type n) noexcept {
         pointer p = get();
         p += n;
-        *this = offset_ptr(p);
+        set(p);
         return *this;
     }
 
@@ -606,24 +629,24 @@ public:
     SHM_FORCE_INLINE offset_ptr& operator-=(difference_type n) noexcept {
         pointer p = get();
         p -= n;
-        *this = offset_ptr(p);
+        set(p);
         return *this;
     }
 
     template <class U = T>
     requires (!std::is_void_v<U>)
     [[nodiscard]] SHM_FORCE_INLINE offset_ptr operator+(difference_type n) const noexcept {
-        offset_ptr tmp(*this);
-        tmp += n;
-        return tmp;
+        pointer p = get();
+        p += n;
+        return offset_ptr(p);
     }
 
     template <class U = T>
     requires (!std::is_void_v<U>)
     [[nodiscard]] SHM_FORCE_INLINE offset_ptr operator-(difference_type n) const noexcept {
-        offset_ptr tmp(*this);
-        tmp -= n;
-        return tmp;
+        pointer p = get();
+        p -= n;
+        return offset_ptr(p);
     }
 
     template <class U = T>
