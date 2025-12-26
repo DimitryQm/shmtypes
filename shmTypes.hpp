@@ -47,6 +47,20 @@
   #include <unistd.h>
 #endif
 
+#ifdef _WIN32
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+#if defined(_WIN32) && defined(SHM_WIN32_USE_SDDL_DACL)
+  #include <sddl.h>
+#endif
+
+#endif
+
 #ifndef SHM_OFFSET_PTR_DEBUG
   #define SHM_OFFSET_PTR_DEBUG 0
 #endif
@@ -57,6 +71,31 @@
 #else
   #define SHM_ASSERT(x) ((void)0)
 #endif
+
+#if defined(_WIN32)
+
+#ifndef SHM_WIN32_OBJECT_NAMESPACE
+  #define SHM_WIN32_OBJECT_NAMESPACE L"Local\\"
+#endif
+
+#ifndef SHM_WIN32_ZERO_ON_CREATE
+  #define SHM_WIN32_ZERO_ON_CREATE 1
+#endif
+
+#ifndef SHM_WIN32_PREFETCH_BYTES_ON_OPEN
+  #define SHM_WIN32_PREFETCH_BYTES_ON_OPEN 0
+#endif
+
+#ifndef SHM_WIN32_TRY_VIRTUAL_LOCK
+  #define SHM_WIN32_TRY_VIRTUAL_LOCK 0
+#endif
+
+#ifndef SHM_WIN32_MAP_ACCESS
+  #define SHM_WIN32_MAP_ACCESS (FILE_MAP_READ | FILE_MAP_WRITE)
+#endif
+
+#endif
+
 
 namespace shm {
 
@@ -583,8 +622,6 @@ private:
 
 
 
-
-
 namespace detail::seg {
 
 #if !defined(_WIN32)
@@ -646,6 +683,273 @@ static inline void nanosleep_backoff_(std::size_t attempt) noexcept {
 
 #endif
 
+#if defined(_WIN32)
+#if defined(_MSC_VER)
+      #define SHM_FORCE_INLINE __forceinline
+    #else
+      #define SHM_FORCE_INLINE inline __attribute__((always_inline))
+    #endif
+
+    [[nodiscard]] SHM_FORCE_INLINE DWORD last_error() noexcept {
+        return ::GetLastError();
+    }
+
+    [[nodiscard]] inline std::system_error win32_error(const char* op,
+                                                       std::string_view portable_name,
+                                                       DWORD err) {
+        if (err == 0) err = ERROR_GEN_FAILURE;
+        std::error_code ec(static_cast<int>(err), std::system_category());
+
+        std::string msg;
+        msg.reserve(320);
+        msg.append("shm::segment: ");
+        msg.append(op);
+        msg.append(" failed (name=");
+        msg.append(portable_name.data(), portable_name.size());
+        msg.append(", GetLastError=");
+        msg.append(std::to_string(static_cast<unsigned long>(err)));
+        msg.append(", ");
+        msg.append(ec.message());
+        msg.append(")");
+
+        return std::system_error(ec, msg);
+    }
+    [[nodiscard]] inline std::wstring utf8_to_wstring_strict(std::string_view s) {
+        if (s.empty()) return std::wstring();
+
+        if (s.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            throw win32_error("utf8_to_wstring(length overflow)", s, ERROR_INVALID_PARAMETER);
+        }
+
+        const int src_len = static_cast<int>(s.size());
+        constexpr DWORD flags = MB_ERR_INVALID_CHARS;
+
+        int needed = ::MultiByteToWideChar(CP_UTF8, flags, s.data(), src_len, nullptr, 0);
+        if (needed <= 0) {
+            throw win32_error("MultiByteToWideChar(size)", s, last_error());
+        }
+
+        std::wstring out(static_cast<std::size_t>(needed), L'\0');
+
+        int written = ::MultiByteToWideChar(CP_UTF8, flags, s.data(), src_len, out.data(), needed);
+        if (written != needed) {
+            throw win32_error("MultiByteToWideChar(convert)", s, last_error());
+        }
+
+        return out;
+    }
+
+    [[nodiscard]] inline std::wstring win32_object_name_from_portable(std::string_view portable_name) {
+        if (portable_name.size() < 2 || portable_name[0] != '/') {
+            throw win32_error("win32_object_name_from_portable(invalid portable name)",
+                              portable_name,
+                              ERROR_INVALID_NAME);
+        }
+
+        // Drop the leading '/', keep body as UTF-8.
+        std::wstring wbody = utf8_to_wstring_strict(
+            std::string_view(portable_name.data() + 1, portable_name.size() - 1)
+        );
+
+        constexpr std::wstring_view prefix = SHM_WIN32_OBJECT_NAMESPACE;
+
+        std::wstring wname;
+        wname.reserve(prefix.size() + wbody.size());
+        wname.append(prefix.data(), prefix.size());
+        wname.append(wbody);
+        return wname;
+    }
+
+    struct win32_sysinfo_cache final {
+        DWORD page_size = 4096;
+        DWORD alloc_granularity = 64 * 1024;
+
+        win32_sysinfo_cache() noexcept {
+            SYSTEM_INFO si{};
+            ::GetSystemInfo(&si);
+            if (si.dwPageSize) page_size = si.dwPageSize;
+            if (si.dwAllocationGranularity) alloc_granularity = si.dwAllocationGranularity;
+        }
+    };
+
+    [[nodiscard]] inline const win32_sysinfo_cache& sysinfo() noexcept {
+        static const win32_sysinfo_cache s;
+        return s;
+    }
+
+    [[nodiscard]] SHM_FORCE_INLINE std::size_t round_up(std::size_t x, std::size_t a) noexcept {
+        if (a == 0) return x;
+        const std::size_t r = x % a;
+        return r == 0 ? x : (x + (a - r));
+    }
+
+    struct unique_handle final {
+        HANDLE h = NULL;
+
+        unique_handle() noexcept = default;
+        explicit unique_handle(HANDLE v) noexcept : h(v) {}
+        unique_handle(const unique_handle&) = delete;
+        unique_handle& operator=(const unique_handle&) = delete;
+
+        unique_handle(unique_handle&& o) noexcept : h(o.h) { o.h = NULL; }
+        unique_handle& operator=(unique_handle&& o) noexcept {
+            if (this != &o) {
+                reset();
+                h = o.h;
+                o.h = NULL;
+            }
+            return *this;
+        }
+
+        ~unique_handle() noexcept { reset(); }
+
+        void reset(HANDLE nh = NULL) noexcept {
+            if (h != NULL) {
+                ::CloseHandle(h);
+            }
+            h = nh;
+        }
+
+        [[nodiscard]] HANDLE get() const noexcept { return h; }
+        [[nodiscard]] explicit operator bool() const noexcept { return h != NULL; }
+
+        [[nodiscard]] HANDLE release() noexcept {
+            HANDLE out = h;
+            h = NULL;
+            return out;
+        }
+    };
+
+    struct unique_view final {
+        void* p = nullptr;
+
+        unique_view() noexcept = default;
+        explicit unique_view(void* v) noexcept : p(v) {}
+        unique_view(const unique_view&) = delete;
+        unique_view& operator=(const unique_view&) = delete;
+
+        unique_view(unique_view&& o) noexcept : p(o.p) { o.p = nullptr; }
+        unique_view& operator=(unique_view&& o) noexcept {
+            if (this != &o) {
+                reset();
+                p = o.p;
+                o.p = nullptr;
+            }
+            return *this;
+        }
+
+        ~unique_view() noexcept { reset(); }
+
+        void reset(void* np = nullptr) noexcept {
+            if (p) {
+                ::UnmapViewOfFile(p);
+            }
+            p = np;
+        }
+
+        [[nodiscard]] void* get() const noexcept { return p; }
+        [[nodiscard]] explicit operator bool() const noexcept { return p != nullptr; }
+
+        [[nodiscard]] void* release() noexcept {
+            void* out = p;
+            p = nullptr;
+            return out;
+        }
+    };
+
+    
+    [[nodiscard]] inline std::uint64_t query_section_max_size_bytes(HANDLE hMap) noexcept {
+        if (hMap == NULL) return 0;
+
+        // NtQuerySection signature.
+        using NTSTATUS = long;
+        using SECTION_INFORMATION_CLASS = int;
+
+        struct LARGE_INTEGER_ {
+            std::int64_t QuadPart;
+        };
+        struct SECTION_BASIC_INFORMATION_ {
+            void* BaseAddress;
+            unsigned long AllocationAttributes;
+            LARGE_INTEGER_ MaximumSize;
+        };
+
+        constexpr SECTION_INFORMATION_CLASS SectionBasicInformation = 0;
+
+        using NtQuerySectionFn = NTSTATUS (NTAPI*)(HANDLE, SECTION_INFORMATION_CLASS, void*, unsigned long, unsigned long*);
+
+        HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+        if (!ntdll) return 0;
+
+        auto* fn = reinterpret_cast<NtQuerySectionFn>(::GetProcAddress(ntdll, "NtQuerySection"));
+        if (!fn) return 0;
+
+        SECTION_BASIC_INFORMATION_ info{};
+        unsigned long ret_len = 0;
+        NTSTATUS st = fn(hMap, SectionBasicInformation, &info, sizeof(info), &ret_len);
+        if (st < 0) return 0;
+        if (info.MaximumSize.QuadPart <= 0) return 0;
+
+        return static_cast<std::uint64_t>(info.MaximumSize.QuadPart);
+    }
+
+    inline void prefetch_best_effort(void* base, std::size_t bytes) noexcept {
+    #if SHM_WIN32_PREFETCH_BYTES_ON_OPEN
+        if (!base || bytes == 0) return;
+
+        using PrefetchVirtualMemoryFn = BOOL (WINAPI*)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+
+        HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
+        if (!k32) return;
+
+        auto* fn = reinterpret_cast<PrefetchVirtualMemoryFn>(::GetProcAddress(k32, "PrefetchVirtualMemory"));
+        if (!fn) return;
+
+        WIN32_MEMORY_RANGE_ENTRY range{};
+        range.VirtualAddress = base;
+        range.NumberOfBytes = bytes;
+
+        (void)fn(::GetCurrentProcess(), 1, &range, 0);
+    #else
+        (void)base;
+        (void)bytes;
+    #endif
+    }
+
+    #if defined(SHM_WIN32_USE_SDDL_DACL)
+
+    struct sddl_security final {
+        SECURITY_ATTRIBUTES sa{};
+        PSECURITY_DESCRIPTOR sd = nullptr;
+
+        sddl_security() noexcept = default;
+        sddl_security(const sddl_security&) = delete;
+        sddl_security& operator=(const sddl_security&) = delete;
+
+        ~sddl_security() noexcept {
+            if (sd) {
+                ::LocalFree(sd);
+                sd = nullptr;
+            }
+        }
+
+        [[nodiscard]] SECURITY_ATTRIBUTES* build_or_throw(std::wstring_view sddl, std::string_view name_for_errors) {
+            if (sddl.empty()) return nullptr;
+
+            if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.data(), SDDL_REVISION_1, &sd, nullptr)) {
+                throw win32_error("ConvertStringSecurityDescriptorToSecurityDescriptorW", name_for_errors, last_error());
+            }
+
+            sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+            sa.lpSecurityDescriptor = sd;
+            sa.bInheritHandle = FALSE;
+            return &sa;
+        }
+    };
+
+#endif
+
 } // namespace detail::seg
 
 
@@ -659,12 +963,14 @@ public:
 
     segment(const char* name, std::size_t size, open_mode mode)
 #if defined(_WIN32)
-        : base_(nullptr)
-        , size_(0)
-        , map_size_(0)
-        , valid_(false)
-        , created_(false)
-        , name_()
+    : hMapFile_(NULL)
+    , base_(nullptr)
+    , size_(0)
+    , map_size_(0)
+    , valid_(false)
+    , created_(false)
+    , name_(detail::seg::normalize_name_(name))
+
 #else
         : fd_(-1)
         , base_(nullptr)
@@ -918,13 +1224,14 @@ public:
 
 private:
 #if defined(_WIN32)
-    void* base_;
+
     std::size_t size_;
     std::size_t map_size_;
     bool valid_;
     bool created_;
     std::string name_;
 #else
+    HANDLE hMapFile_ = NULL;
     int fd_;
     void* base_;
     std::size_t size_;
