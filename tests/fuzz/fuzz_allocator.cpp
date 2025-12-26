@@ -11,8 +11,15 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include <unistd.h>
-#include <errno.h>   
+
+#if !defined(_WIN32)
+  #include <unistd.h>
+  #include errno.h
+    #else
+
+  #include <windows.h>
+#endif
+
 namespace {
 
 #define CHECK(expr)                                                                             \
