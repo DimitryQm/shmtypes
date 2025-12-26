@@ -945,7 +945,7 @@ static inline void nanosleep_backoff_(std::size_t attempt) noexcept {
     };
 
 #endif
-
+#endif
 } // namespace detail::seg
 
 
